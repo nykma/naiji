@@ -1,0 +1,23 @@
+{
+  "name": "baby-milk-tracker",
+  "version": "1.0.0",
+  "private": true,
+  "description": "奶记 · 婴儿喂奶 / 大小便记录（Node.js 内置 HTTP + SQLite，零第三方依赖）",
+  "type": "module",
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js",
+    "test": "node --test",
+    "test:watch": "node --test --watch"
+  },
+  "keywords": [
+    "baby",
+    "feeding",
+    "tracker",
+    "sqlite"
+  ],
+  "license": "UNLICENSED"
+}

@@ -1,0 +1,191 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <title>奶记 · 婴儿喂养记录</title>
+    <meta name="description" content="给新手爸妈的婴儿喂养记录：一键记录喂奶与大小便，实时查看距上次喂奶时间。" />
+    <meta name="format-detection" content="telephone=no" />
+    <meta name="color-scheme" content="light dark" />
+    <meta name="theme-color" content="#FFF8F2" media="(prefers-color-scheme: light)" />
+    <meta name="theme-color" content="#171110" media="(prefers-color-scheme: dark)" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="default" />
+    <meta name="apple-mobile-web-app-title" content="奶记" />
+    <link rel="icon" href="/icon.svg" type="image/svg+xml" />
+    <link rel="apple-touch-icon" href="/icon.svg" />
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <link rel="stylesheet" href="/app.css" />
+    <script type="module" src="/app.js"></script>
+  </head>
+  <body>
+    <div class="app">
+      <header class="topbar">
+        <div class="brand">
+          <img class="brand-mark" src="/icon.svg" alt="" width="44" height="44" decoding="async" />
+          <span class="brand-text">
+            <span class="brand-name">奶记</span>
+            <span class="brand-sub">婴儿喂养记录</span>
+          </span>
+        </div>
+        <a class="export-link" data-testid="export-csv" href="/api/export.csv" download aria-label="导出 CSV">
+          <svg
+            class="export-icon"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="2"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+            aria-hidden="true"
+          >
+            <path d="M12 4v11" />
+            <path d="m7.5 10.5 4.5 4.5 4.5-4.5" />
+            <path d="M5 19.5h14" />
+          </svg>
+          <span>导出 CSV</span>
+        </a>
+      </header>
+
+      <main class="main">
+        <div class="error-banner" id="loadError" data-testid="load-error" role="alert" hidden>
+          <span class="error-emoji" aria-hidden="true">😕</span>
+          <p class="error-text" id="loadErrorText">加载失败</p>
+          <button type="button" class="retry-btn" id="retryLoad" data-testid="retry-load">重试</button>
+        </div>
+
+        <section class="card hero" aria-labelledby="heroTitle">
+          <p class="hero-eyebrow" id="heroTitle">距离上次喂奶</p>
+          <p class="hero-duration" data-testid="gap-duration">…</p>
+          <p class="hero-last" data-testid="gap-last-feed">正在加载…</p>
+          <div class="hero-divider" aria-hidden="true"></div>
+          <p class="hero-diaper" data-testid="gap-last-diaper">正在加载…</p>
+        </section>
+
+        <section class="card feed" aria-labelledby="feedTitle">
+          <div class="card-head">
+            <h2 class="card-title" id="feedTitle">记录喂奶</h2>
+            <span class="card-hint">点一下即记录</span>
+          </div>
+
+          <div class="segmented" role="group" aria-label="喂奶类型">
+            <button type="button" class="seg-btn" data-testid="type-formula" data-feed-type="formula" aria-pressed="true">
+              奶粉
+            </button>
+            <button type="button" class="seg-btn" data-testid="type-breast-milk" data-feed-type="breast_milk" aria-pressed="false">
+              母乳·瓶喂
+            </button>
+            <button type="button" class="seg-btn" data-testid="type-breast-direct" data-feed-type="breast_direct" aria-pressed="false">
+              亲喂
+            </button>
+          </div>
+
+          <div class="amount-panel" id="amountPanel">
+            <p class="field-label">奶量<span class="field-hint" id="amountHint"> · 奶粉</span></p>
+            <div class="chips" role="group" aria-label="快捷奶量（毫升）">
+              <button type="button" class="chip record-btn" data-testid="volume-chip-30" data-amount="30">
+                <span class="chip-num">30</span><span class="chip-unit">ml</span>
+              </button>
+              <button type="button" class="chip record-btn" data-testid="volume-chip-60" data-amount="60">
+                <span class="chip-num">60</span><span class="chip-unit">ml</span>
+              </button>
+              <button type="button" class="chip record-btn" data-testid="volume-chip-90" data-amount="90">
+                <span class="chip-num">90</span><span class="chip-unit">ml</span>
+              </button>
+              <button type="button" class="chip record-btn" data-testid="volume-chip-120" data-amount="120">
+                <span class="chip-num">120</span><span class="chip-unit">ml</span>
+              </button>
+              <button type="button" class="chip record-btn" data-testid="volume-chip-150" data-amount="150">
+                <span class="chip-num">150</span><span class="chip-unit">ml</span>
+              </button>
+              <button type="button" class="chip record-btn" data-testid="volume-chip-180" data-amount="180">
+                <span class="chip-num">180</span><span class="chip-unit">ml</span>
+              </button>
+            </div>
+
+            <form class="custom-row" id="customForm" autocomplete="off" novalidate>
+              <label class="sr-only" for="customAmount">自定义奶量（毫升）</label>
+              <div class="amount-input-wrap">
+                <input
+                  id="customAmount"
+                  class="amount-input"
+                  data-testid="custom-amount-input"
+                  type="text"
+                  inputmode="numeric"
+                  pattern="[0-9]*"
+                  enterkeyhint="done"
+                  maxlength="4"
+                  value="120"
+                />
+                <span class="input-unit" aria-hidden="true">ml</span>
+              </div>
+              <button type="submit" class="btn btn-primary record-btn" data-testid="custom-amount-submit">
+                记录
+              </button>
+            </form>
+          </div>
+
+          <div class="direct-panel" id="directPanel" hidden>
+            <button type="button" class="btn-direct record-btn" data-testid="record-breast-direct">
+              <span class="btn-direct-emoji" aria-hidden="true">🤱</span>
+              <span>亲喂一次</span>
+            </button>
+            <p class="direct-hint">亲喂无需奶量，点一下就记下这次喂奶时间</p>
+          </div>
+        </section>
+
+        <section class="card diaper" aria-labelledby="diaperTitle">
+          <div class="card-head">
+            <h2 class="card-title" id="diaperTitle">记录大小便</h2>
+            <span class="card-hint">点一下即记录</span>
+          </div>
+          <div class="diaper-grid">
+            <button type="button" class="diaper-btn diaper-btn--pee record-btn" data-testid="record-pee">
+              <span class="diaper-emoji" aria-hidden="true">💧</span>
+              <span class="diaper-label">小便</span>
+            </button>
+            <button type="button" class="diaper-btn diaper-btn--poop record-btn" data-testid="record-poop">
+              <span class="diaper-emoji" aria-hidden="true">💩</span>
+              <span class="diaper-label">大便</span>
+            </button>
+          </div>
+        </section>
+
+        <section class="card summary" aria-labelledby="summaryTitle">
+          <h2 class="summary-title" id="summaryTitle">今日汇总</h2>
+          <p class="summary-line" data-testid="today-summary">正在加载…</p>
+        </section>
+
+        <section class="card timeline-card" aria-labelledby="timelineTitle">
+          <div class="card-head">
+            <h2 class="card-title" id="timelineTitle">记录时间线</h2>
+            <span class="card-hint" id="historyCount"></span>
+          </div>
+
+          <div class="history" data-testid="history-list">
+            <p class="loading-note">正在加载记录…</p>
+          </div>
+
+          <div class="empty-state" id="emptyState" data-testid="empty-state" hidden>
+            <span class="empty-emoji" aria-hidden="true">🍼</span>
+            <p class="empty-title">还没有任何记录</p>
+            <p class="empty-sub">点上面的奶量或大小便按钮，记下第一笔吧</p>
+          </div>
+
+          <div class="load-more-wrap" id="loadMoreWrap" hidden>
+            <button type="button" class="load-more" id="loadMore" data-testid="load-more">加载更多</button>
+          </div>
+        </section>
+
+        <p class="footer-note">记录只保存在这台设备的数据库里 · 点「导出 CSV」可备份</p>
+      </main>
+    </div>
+
+    <div class="toast-root" id="toastRoot" aria-live="polite" aria-atomic="true"></div>
+
+    <noscript>
+      <p class="noscript-note">奶记需要启用 JavaScript 才能使用，请在浏览器设置中开启后刷新页面。</p>
+    </noscript>
+  </body>
+</html>

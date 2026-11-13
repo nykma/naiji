@@ -1,0 +1,28 @@
+{
+  "name": "奶记 · 婴儿喂养记录",
+  "short_name": "奶记",
+  "description": "给新手爸妈的婴儿喂养记录：一键记录喂奶与大小便，实时查看距上次喂奶时间。",
+  "lang": "zh-CN",
+  "dir": "ltr",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#FFF8F2",
+  "theme_color": "#F26A4F",
+  "categories": ["health", "lifestyle", "utilities"],
+  "icons": [
+    {
+      "src": "/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    },
+    {
+      "src": "/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "maskable"
+    }
+  ]
+}
