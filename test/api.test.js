@@ -1,428 +1,440 @@
 /**
- * src/server.js HTTP API 集成测试（真实 HTTP + node:sqlite 临时数据库）
+ * HTTP API 集成测试（v2）。
  *
- * - 每个顶层 describe 使用独立 createApp()（独立临时 DB 目录、独立端口），互不污染。
- * - server.listen(0, '127.0.0.1') 后从 server.address().port 取端口，用全局 fetch 访问。
- * - 所有时间相关断言使用固定 now（createApp 的 now 注入），不依赖真实时钟。
+ * 每个用例用 fs.mkdtemp 临时目录 + :memory-free 文件 DB + listen(0) 随机端口，
+ * 注入固定 now，结束后 close + 清理；不写仓库 data/，可并行重复运行。
  */
-
-import { after, before, describe, test } from 'node:test';
+import { describe, test } from 'node:test';
 import assert from 'node:assert/strict';
-import nodeHttp from 'node:http';
-import os from 'node:os';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 
-import { createApp } from '../src/server.js';
+import { createApp } from '../server/src/server.js';
 
-// 固定「服务器当前时间」：2026-11-13T04:00:00Z = 东八区 2026-11-13 12:00
-const FIXED_NOW = Date.UTC(2026, 10, 13, 4, 0, 0);
+const NOW = Date.UTC(2026, 10, 13, 4, 0, 0); // 2026-11-13T04:00:00Z
+const MINUTE = 60_000;
+const HOUR = 60 * MINUTE;
+const DAY = 24 * HOUR;
 const TZ_SHANGHAI = -480;
+const SH_DAY_START = Date.UTC(2026, 10, 12, 16, 0, 0); // 东八区 2026-11-13 00:00
+const SH_DAY_END = Date.UTC(2026, 10, 13, 16, 0, 0); // 东八区 2026-11-14 00:00
 
-/** 东八区 2026-11-13 本地 hh:mm → epoch ms（h < 8 时落到 UTC 前一天） */
-function shanghai(h, min = 0) {
-  return Date.UTC(2026, 10, 13, h - 8, min, 0, 0);
-}
+const INDEX_HTML = '<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><title>奶记</title></head><body><div id="app">奶记测试页</div><script type="module" src="/app.js"></script></body></html>';
+const APP_JS = 'export const marker = "naiji-test-app";\n';
+const STYLE_CSS = 'body { color: #333; }\n';
+const SUB_PAGE = '<!doctype html><html><body>sub page</body></html>';
 
-function pad2(n) {
-  return n < 10 ? `0${n}` : String(n);
-}
+/** 启动临时应用，返回 { url, app, dir }；测试结束自动关闭并删除目录 */
+async function startApp(t, options = {}) {
+  const dir = mkdtempSync(path.join(tmpdir(), 'naiji-api-'));
+  const webDir = path.join(dir, 'web');
+  mkdirSync(path.join(webDir, 'sub'), { recursive: true });
+  writeFileSync(path.join(webDir, 'index.html'), INDEX_HTML);
+  writeFileSync(path.join(webDir, 'app.js'), APP_JS);
+  writeFileSync(path.join(webDir, 'style.css'), STYLE_CSS);
+  writeFileSync(path.join(webDir, 'sub', 'page.html'), SUB_PAGE);
 
-function localDateKey(ms) {
-  const d = new Date(ms);
-  return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
-}
-
-function localStamp(ms) {
-  const d = new Date(ms);
-  return `${localDateKey(ms)} ${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
-}
-
-// 压掉 createApp 每请求一行的访问日志（避免测试输出被淹没），其余日志保留。
-const originalConsoleLog = console.log.bind(console);
-console.log = (...args) => {
-  const first = args[0];
-  if (typeof first === 'string' && /^(GET|HEAD|POST|PUT|PATCH|DELETE|OPTIONS) \//.test(first)) return;
-  originalConsoleLog(...args);
-};
-after(() => {
-  console.log = originalConsoleLog;
-});
-
-// ---------------------------------------------------------------------------
-// 测试辅助
-// ---------------------------------------------------------------------------
-
-/** 启动一个独立 app：临时 DB 目录 + 随机端口；返回 ctx.stop() 关闭并清理。 */
-async function startApp({ publicDir, now = () => FIXED_NOW } = {}) {
-  const dir = await mkdtemp(path.join(os.tmpdir(), 'bmt-api-'));
   const app = createApp({
     dbPath: path.join(dir, 'baby.db'),
-    now,
-    ...(publicDir ? { publicDir } : {}),
+    webDir,
+    serveWeb: true,
+    now: () => NOW,
+    ...options,
   });
   await new Promise((resolve, reject) => {
     app.server.once('error', reject);
     app.server.listen(0, '127.0.0.1', resolve);
   });
-  const port = app.server.address().port;
+  const url = `http://127.0.0.1:${app.server.address().port}`;
+  t.after(async () => {
+    await app.close();
+    rmSync(dir, { recursive: true, force: true });
+  });
+  return { app, url, dir, webDir };
+}
+
+function postJson(base, pathname, body, extraHeaders = {}) {
+  return fetch(`${base}${pathname}`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', ...extraHeaders },
+    body: typeof body === 'string' ? body : JSON.stringify(body),
+  });
+}
+
+const postFeeding = (base, body, headers) => postJson(base, '/api/feedings', body, headers);
+const postDiaper = (base, body, headers) => postJson(base, '/api/diapers', body, headers);
+const getJson = (base, pathname) => fetch(`${base}${pathname}`);
+
+/** 断言错误响应：状态码 + 错误码 + 非空中文 message */
+async function assertError(res, status, code) {
+  assert.equal(res.status, status, `期望状态码 ${status}，实际 ${res.status}`);
+  assert.match(res.headers.get('content-type') ?? '', /^application\/json/);
+  const body = await res.json();
+  assert.equal(body.error, code);
+  assert.equal(typeof body.message, 'string');
+  assert.ok(body.message.length > 0, 'message 不能为空');
+  return body;
+}
+
+function expectedFeedEvent({ id, feedTypes, amountMl, note = null, happenedAt }) {
   return {
-    app,
-    dir,
-    port,
-    baseUrl: `http://127.0.0.1:${port}`,
-    async stop() {
-      await app.close();
-      await rm(dir, { recursive: true, force: true });
-    },
+    id,
+    kind: 'feed',
+    feedTypes,
+    amountMl,
+    diaperKind: null,
+    note,
+    happenedAt,
+    createdAt: NOW,
   };
 }
 
-async function apiRequest(baseUrl, pathname, options = {}) {
-  const response = await fetch(`${baseUrl}${pathname}`, options);
-  const text = await response.text();
-  let json;
-  if (text) {
-    try {
-      json = JSON.parse(text);
-    } catch {
-      json = undefined;
-    }
-  }
-  return { status: response.status, headers: response.headers, text, json };
+function expectedDiaperEvent({ id, diaperKind, note = null, happenedAt }) {
+  return {
+    id,
+    kind: 'diaper',
+    feedTypes: null,
+    amountMl: null,
+    diaperKind,
+    note,
+    happenedAt,
+    createdAt: NOW,
+  };
 }
 
-function postJson(baseUrl, pathname, payload) {
-  return apiRequest(baseUrl, pathname, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload),
-  });
+/** 直接通过 Store 造数据（用于构造 API 校验不允许的边界时间/批量数据） */
+function seedFeed(store, happenedAt, feedTypes, amountMl = null, note = null) {
+  return store.createFeedEvent({ feedTypes, amountMl, note, happenedAt, createdAt: NOW });
 }
 
-function postRaw(baseUrl, pathname, body, contentType = 'application/json') {
-  return apiRequest(baseUrl, pathname, {
-    method: 'POST',
-    headers: contentType ? { 'Content-Type': contentType } : {},
-    body,
-  });
-}
-
-/** 断言 4xx/5xx 错误响应：状态码 + error code + 非空中文 message。 */
-function assertApiError(result, expectedStatus, expectedCode) {
-  assert.equal(result.status, expectedStatus, `期望状态码 ${expectedStatus}，实际 ${result.status}；body=${result.text}`);
-  assert.ok(result.json, `响应不是 JSON：${result.text}`);
-  assert.equal(result.json.error, expectedCode);
-  assert.equal(typeof result.json.message, 'string');
-  assert.ok(result.json.message.length > 0, 'message 不能为空');
-}
-
-/** 用原始 http.request 发请求（不受 fetch/URL 客户端规范化影响，用于路径穿越用例）。 */
-function rawGet(port, rawPath) {
-  return new Promise((resolve, reject) => {
-    const request = nodeHttp.request({ host: '127.0.0.1', port, path: rawPath, method: 'GET' }, (response) => {
-      let body = '';
-      response.setEncoding('utf8');
-      response.on('data', (chunk) => {
-        body += chunk;
-      });
-      response.on('end', () => resolve({ status: response.statusCode, headers: response.headers, body }));
-    });
-    request.on('error', reject);
-    request.end();
-  });
-}
-
-async function getCsv(baseUrl) {
-  const response = await fetch(`${baseUrl}/api/export.csv`);
-  const buffer = Buffer.from(await response.arrayBuffer());
-  return { response, buffer, text: buffer.toString('utf8') };
+function seedDiaper(store, happenedAt, diaperKind, note = null) {
+  return store.createDiaperEvent({ diaperKind, note, happenedAt, createdAt: NOW });
 }
 
 // ---------------------------------------------------------------------------
-// 基础路由
+// 健康检查 / 404
 // ---------------------------------------------------------------------------
 
-describe('GET /api/health 与基础路由', () => {
-  let ctx;
-  before(async () => {
-    ctx = await startApp();
-  });
-  after(async () => {
-    if (ctx) await ctx.stop();
-  });
-
-  test('GET /api/health → 200 { ok: true }，JSON 响应', async () => {
-    const result = await apiRequest(ctx.baseUrl, '/api/health');
-    assert.equal(result.status, 200);
-    assert.match(result.headers.get('content-type') ?? '', /^application\/json; charset=utf-8/);
-    assert.deepEqual(result.json, { ok: true });
+describe('基础路由', () => {
+  test('GET /api/health → 200 { ok: true }，JSON + no-store + nosniff', async (t) => {
+    const { url } = await startApp(t);
+    const res = await fetch(`${url}/api/health`);
+    assert.equal(res.status, 200);
+    assert.match(res.headers.get('content-type'), /^application\/json/);
+    assert.equal(res.headers.get('cache-control'), 'no-store');
+    assert.equal(res.headers.get('x-content-type-options'), 'nosniff');
+    assert.deepEqual(await res.json(), { ok: true });
   });
 
-  test('未知 /api 路由 → 404 JSON { error: "not_found" }', async () => {
-    const cases = [
-      ['GET', '/api/nope'],
-      ['POST', '/api/nope'],
-      ['GET', '/api/feedings'], // 只有 POST，GET 应落到 404 JSON 而不是静态 404
-      ['POST', '/api/events'],
-      ['DELETE', '/api/state'],
-    ];
-    for (const [method, pathname] of cases) {
-      const result = await apiRequest(ctx.baseUrl, pathname, { method, body: method === 'POST' ? '{}' : undefined });
-      assertApiError(result, 404, 'not_found');
-      assert.match(result.headers.get('content-type') ?? '', /^application\/json/);
-    }
-  });
-
-  test('GET /api/export.csv 空库 → BOM + 仅表头 + CRLF', async () => {
-    const { buffer, text, response } = await getCsv(ctx.baseUrl);
-    assert.equal(response.status, 200);
-    assert.deepEqual([...buffer.subarray(0, 3)], [0xef, 0xbb, 0xbf], 'CSV 必须以 UTF-8 BOM 开头');
-    assert.equal(text, '\uFEFF时间,类别,项目,奶量(ml),备注\r\n');
+  test('未知 /api 路径 → 404 not_found；/api 前缀之外的静态路径不返回 JSON 404', async (t) => {
+    const { url } = await startApp(t);
+    await assertError(await getJson(url, '/api/nope'), 404, 'not_found');
+    await assertError(await getJson(url, '/api/events/extra/segments'), 404, 'not_found');
   });
 });
 
 // ---------------------------------------------------------------------------
-// POST /api/feedings
+// POST /api/feedings · 成功
 // ---------------------------------------------------------------------------
 
-describe('POST /api/feedings', () => {
-  let ctx;
-  before(async () => {
-    ctx = await startApp();
-  });
-  after(async () => {
-    if (ctx) await ctx.stop();
-  });
-
-  test('formula 成功：201，事件字段形状正确，note 去空格', async () => {
-    const happenedAt = shanghai(9, 0);
-    const result = await postJson(ctx.baseUrl, '/api/feedings', {
-      feedType: 'formula',
+describe('POST /api/feedings · 成功', () => {
+  test('多标签（乱序入参）成功，返回规范顺序，备注 trim，createdAt=now', async (t) => {
+    const { url } = await startApp(t);
+    const happenedAt = NOW - HOUR;
+    const res = await postFeeding(url, {
+      feedTypes: ['breast_milk', 'formula'],
       amountMl: 120,
-      happenedAt,
       note: '  夜里那次  ',
-    });
-    assert.equal(result.status, 201);
-    const event = result.json.event;
-    assert.deepEqual(event, {
-      id: event.id,
-      kind: 'feed',
-      feedType: 'formula',
-      amountMl: 120,
-      diaperKind: null,
-      note: '夜里那次',
-      happenedAt,
-      createdAt: FIXED_NOW,
-    });
-    assert.ok(Number.isInteger(event.id) && event.id > 0);
-  });
-
-  test('breast_milk 成功：201 且 amountMl 保留', async () => {
-    const happenedAt = shanghai(9, 30);
-    const result = await postJson(ctx.baseUrl, '/api/feedings', {
-      feedType: 'breast_milk',
-      amountMl: 90,
       happenedAt,
     });
-    assert.equal(result.status, 201);
-    assert.deepEqual(result.json.event, {
-      id: result.json.event.id,
-      kind: 'feed',
-      feedType: 'breast_milk',
-      amountMl: 90,
-      diaperKind: null,
-      note: null,
-      happenedAt,
-      createdAt: FIXED_NOW,
-    });
+    assert.equal(res.status, 201);
+    const body = await res.json();
+    assert.ok(Number.isInteger(body.event.id) && body.event.id > 0);
+    assert.deepEqual(
+      body.event,
+      expectedFeedEvent({
+        id: body.event.id,
+        feedTypes: ['formula', 'breast_milk'],
+        amountMl: 120,
+        note: '夜里那次',
+        happenedAt,
+      }),
+    );
   });
 
-  test('breast_direct 成功：省略 amountMl → null', async () => {
-    const happenedAt = shanghai(10, 0);
-    const result = await postJson(ctx.baseUrl, '/api/feedings', { feedType: 'breast_direct', happenedAt });
-    assert.equal(result.status, 201);
-    const event = result.json.event;
-    assert.equal(event.feedType, 'breast_direct');
-    assert.equal(event.amountMl, null);
-    assert.equal(event.happenedAt, happenedAt);
+  test('v1 旧式 feedType 兼容归一化（formula 带奶量）', async (t) => {
+    const { url } = await startApp(t);
+    const happenedAt = NOW - 2 * HOUR;
+    const res = await postFeeding(url, { feedType: 'formula', amountMl: 150, happenedAt });
+    assert.equal(res.status, 201);
+    const body = await res.json();
+    assert.deepEqual(
+      body.event,
+      expectedFeedEvent({ id: body.event.id, feedTypes: ['formula'], amountMl: 150, happenedAt }),
+    );
   });
 
-  test('breast_direct 显式 amountMl: null 也合法', async () => {
-    const result = await postJson(ctx.baseUrl, '/api/feedings', {
-      feedType: 'breast_direct',
+  test('v1 旧式 feedType=breast_direct 兼容（无奶量）', async (t) => {
+    const { url } = await startApp(t);
+    const res = await postFeeding(url, { feedType: 'breast_direct' });
+    assert.equal(res.status, 201);
+    const body = await res.json();
+    assert.deepEqual(
+      body.event,
+      expectedFeedEvent({ id: body.event.id, feedTypes: ['breast_direct'], amountMl: null, happenedAt: NOW }),
+    );
+  });
+
+  test('仅亲喂：省略 amountMl / 显式 null 均成功且 amountMl 为 null', async (t) => {
+    const { url } = await startApp(t);
+    const omitted = await postFeeding(url, { feedTypes: ['breast_direct'], happenedAt: NOW - 2 * MINUTE });
+    assert.equal(omitted.status, 201);
+    const omittedBody = await omitted.json();
+    assert.equal(omittedBody.event.amountMl, null);
+    assert.deepEqual(omittedBody.event.feedTypes, ['breast_direct']);
+
+    const explicitNull = await postFeeding(url, {
+      feedTypes: ['breast_direct'],
       amountMl: null,
-      happenedAt: shanghai(10, 15),
+      happenedAt: NOW - MINUTE,
     });
-    assert.equal(result.status, 201);
-    assert.equal(result.json.event.amountMl, null);
+    assert.equal(explicitNull.status, 201);
+    assert.equal((await explicitNull.json()).event.amountMl, null);
   });
 
-  test('happenedAt 省略时默认服务器当前时间（now 注入值）', async () => {
-    const result = await postJson(ctx.baseUrl, '/api/feedings', { feedType: 'formula', amountMl: 60 });
-    assert.equal(result.status, 201);
-    assert.equal(result.json.event.happenedAt, FIXED_NOW);
-    assert.equal(result.json.event.createdAt, FIXED_NOW);
-  });
-
-  test('奶量边界 1 与 2000 合法', async () => {
-    for (const amountMl of [1, 2000]) {
-      const result = await postJson(ctx.baseUrl, '/api/feedings', {
-        feedType: 'formula',
-        amountMl,
-        happenedAt: shanghai(11, 0),
-      });
-      assert.equal(result.status, 201, `amountMl=${amountMl} 应合法，body=${result.text}`);
-      assert.equal(result.json.event.amountMl, amountMl);
-    }
-  });
-
-  test('happenedAt 边界：2000-01-01 与 FIXED_NOW + 5 分钟合法', async () => {
-    const okCases = [Date.UTC(2000, 0, 1), FIXED_NOW + 5 * 60_000];
-    for (const happenedAt of okCases) {
-      const result = await postJson(ctx.baseUrl, '/api/feedings', {
-        feedType: 'formula',
-        amountMl: 120,
-        happenedAt,
-      });
-      assert.equal(result.status, 201, `happenedAt=${happenedAt} 应合法，body=${result.text}`);
-      assert.equal(result.json.event.happenedAt, happenedAt);
-    }
-  });
-
-  test('note：空串/纯空白视为 null，省略也是 null', async () => {
-    for (const note of ['', '   ', undefined]) {
-      const payload = { feedType: 'formula', amountMl: 60, happenedAt: shanghai(11, 30) };
-      if (note !== undefined) payload.note = note;
-      const result = await postJson(ctx.baseUrl, '/api/feedings', payload);
-      assert.equal(result.status, 201, `note=${JSON.stringify(note)} 应合法，body=${result.text}`);
-      assert.equal(result.json.event.note, null);
-    }
-  });
-
-  test('note 恰好 200 字符合法（trim 后）', async () => {
-    const note = 'a'.repeat(200);
-    const result = await postJson(ctx.baseUrl, '/api/feedings', {
-      feedType: 'formula',
+  test('亲喂 + 奶粉带奶量成功（混合），标签规范顺序', async (t) => {
+    const { url } = await startApp(t);
+    const res = await postFeeding(url, {
+      feedTypes: ['breast_direct', 'formula'],
       amountMl: 60,
-      happenedAt: shanghai(11, 40),
-      note,
+      happenedAt: NOW - 3 * MINUTE,
     });
-    assert.equal(result.status, 201);
-    assert.equal(result.json.event.note, note);
+    assert.equal(res.status, 201);
+    const body = await res.json();
+    assert.deepEqual(
+      body.event,
+      expectedFeedEvent({
+        id: body.event.id,
+        feedTypes: ['formula', 'breast_direct'],
+        amountMl: 60,
+        happenedAt: NOW - 3 * MINUTE,
+      }),
+    );
   });
 
-  // --- 校验失败 ---
-
-  const invalidFeedTypeCases = [
-    ['缺失 feedType', { amountMl: 120 }],
-    ['未知类型 bottle', { feedType: 'bottle', amountMl: 120 }],
-    ['null', { feedType: null, amountMl: 120 }],
-    ['数字', { feedType: 1, amountMl: 120 }],
-    ['大小写 FORMULA', { feedType: 'FORMULA', amountMl: 120 }],
-    ['未知类型 Mixed', { feedType: 'Mixed', amountMl: 120 }],
-  ];
-  for (const [label, payload] of invalidFeedTypeCases) {
-    test(`feedType 非法（${label}）→ 400 invalid_feed_type`, async () => {
-      const result = await postJson(ctx.baseUrl, '/api/feedings', payload);
-      assertApiError(result, 400, 'invalid_feed_type');
+  test('三个标签 + 奶量上限 2000 成功', async (t) => {
+    const { url } = await startApp(t);
+    const res = await postFeeding(url, {
+      feedTypes: ['breast_direct', 'breast_milk', 'formula'],
+      amountMl: 2000,
     });
-  }
+    assert.equal(res.status, 201);
+    const body = await res.json();
+    assert.deepEqual(body.event.feedTypes, ['formula', 'breast_milk', 'breast_direct']);
+    assert.equal(body.event.amountMl, 2000);
+    assert.equal(body.event.note, null);
+    assert.equal(body.event.happenedAt, NOW);
+    assert.equal(body.event.createdAt, NOW);
+  });
 
-  const invalidAmountCases = [
-    ['缺失 amountMl', { feedType: 'formula' }],
-    ['null', { feedType: 'formula', amountMl: null }],
-    ['0', { feedType: 'formula', amountMl: 0 }],
-    ['2001', { feedType: 'formula', amountMl: 2001 }],
-    ['负数 -1', { feedType: 'formula', amountMl: -1 }],
-    ['小数 1.5', { feedType: 'formula', amountMl: 1.5 }],
-    ['字符串 "120"', { feedType: 'formula', amountMl: '120' }],
-    ['NaN（JSON 序列化为 null）', { feedType: 'formula', amountMl: NaN }],
-    ['Infinity（JSON 序列化为 null）', { feedType: 'formula', amountMl: Infinity }],
-    ['breast_milk 缺失 amountMl', { feedType: 'breast_milk' }],
-    ['breast_milk amountMl = 0', { feedType: 'breast_milk', amountMl: 0 }],
-  ];
-  for (const [label, payload] of invalidAmountCases) {
-    test(`amountMl 非法（${label}）→ 400 invalid_amount`, async () => {
-      const result = await postJson(ctx.baseUrl, '/api/feedings', payload);
-      assertApiError(result, 400, 'invalid_amount');
+  test('奶量下限 1 成功', async (t) => {
+    const { url } = await startApp(t);
+    const res = await postFeeding(url, { feedTypes: ['breast_milk'], amountMl: 1 });
+    assert.equal(res.status, 201);
+    assert.equal((await res.json()).event.amountMl, 1);
+  });
+
+  test('happenedAt 边界：最小 2000-01-01 与 now+5min 均接受', async (t) => {
+    const { url } = await startApp(t);
+    const min = Date.UTC(2000, 0, 1);
+    const maxFuture = NOW + 5 * MINUTE;
+    const r1 = await postFeeding(url, { feedTypes: ['formula'], amountMl: 10, happenedAt: min });
+    assert.equal(r1.status, 201);
+    const r2 = await postFeeding(url, { feedTypes: ['formula'], amountMl: 10, happenedAt: maxFuture });
+    assert.equal(r2.status, 201);
+  });
+
+  test('备注边界：trim 后 200 字符接受；纯空白 → null', async (t) => {
+    const { url } = await startApp(t);
+    const exact = 'x'.repeat(200);
+    const res = await postFeeding(url, {
+      feedTypes: ['formula'],
+      amountMl: 10,
+      note: `  ${exact}  `,
     });
-  }
+    assert.equal(res.status, 201);
+    assert.equal((await res.json()).event.note, exact);
 
-  test('亲喂带 amountMl → 400 unexpected_amount', async () => {
-    for (const amountMl of [120, 0, -1]) {
-      const result = await postJson(ctx.baseUrl, '/api/feedings', { feedType: 'breast_direct', amountMl });
-      assertApiError(result, 400, 'unexpected_amount');
+    const blank = await postFeeding(url, { feedTypes: ['formula'], amountMl: 10, note: '   ' });
+    assert.equal(blank.status, 201);
+    assert.equal((await blank.json()).event.note, null);
+  });
+
+  test('创建后 GET /api/events 能读到该记录', async (t) => {
+    const { url } = await startApp(t);
+    const created = await (
+      await postFeeding(url, { feedTypes: ['formula'], amountMl: 120, note: '可见' })
+    ).json();
+    const res = await getJson(url, '/api/events');
+    assert.equal(res.status, 200);
+    const { events } = await res.json();
+    assert.equal(events.length, 1);
+    assert.deepEqual(events[0], created.event);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// POST /api/feedings · 校验错误
+// ---------------------------------------------------------------------------
+
+describe('POST /api/feedings · 校验错误', () => {
+  test('invalid_feed_types：空 / 重复 / 未知 / 超 3 个 / 非数组', async (t) => {
+    const { url } = await startApp(t);
+    const cases = [
+      ['缺少 feedTypes 与 feedType', { amountMl: 120 }],
+      ['空数组', { feedTypes: [], amountMl: 120 }],
+      ['feedTypes 为 null', { feedTypes: null, amountMl: 120 }],
+      ['重复标签', { feedTypes: ['formula', 'formula'], amountMl: 120 }],
+      ['未知标签', { feedTypes: ['formula', 'juice'], amountMl: 120 }],
+      ['超过 3 个', { feedTypes: ['formula', 'breast_milk', 'breast_direct', 'formula'], amountMl: 120 }],
+      ['非数组（数字）', { feedTypes: 123, amountMl: 120 }],
+      ['非数组（对象）', { feedTypes: { formula: true }, amountMl: 120 }],
+      ['v1 feedType 非字符串', { feedType: 42, amountMl: 120 }],
+    ];
+    for (const [name, body] of cases) {
+      const res = await postFeeding(url, body);
+      assert.equal(res.status, 400, `${name} 应返回 400`);
+      const parsed = await res.json();
+      assert.equal(parsed.error, 'invalid_feed_types', `${name} 错误码不对`);
+    }
+    // 没有产生任何记录
+    const { events } = await (await getJson(url, '/api/events')).json();
+    assert.deepEqual(events, []);
+  });
+
+  test('invalid_amount：缺失 / 0 / 2001 / 负数 / 小数 / 字符串 / 布尔', async (t) => {
+    const { url } = await startApp(t);
+    const cases = [
+      ['formula 缺奶量', { feedTypes: ['formula'] }],
+      ['formula 奶量 null', { feedTypes: ['formula'], amountMl: null }],
+      ['0', { feedTypes: ['formula'], amountMl: 0 }],
+      ['2001', { feedTypes: ['formula'], amountMl: 2001 }],
+      ['负数', { feedTypes: ['formula'], amountMl: -5 }],
+      ['小数', { feedTypes: ['formula'], amountMl: 1.5 }],
+      ['字符串', { feedTypes: ['formula'], amountMl: '120' }],
+      ['布尔', { feedTypes: ['formula'], amountMl: true }],
+      ['breast_milk 缺奶量', { feedTypes: ['breast_milk'] }],
+      ['formula+direct 缺奶量', { feedTypes: ['formula', 'breast_direct'] }],
+      ['v1 兼容缺奶量', { feedType: 'formula' }],
+    ];
+    for (const [name, body] of cases) {
+      const res = await postFeeding(url, body);
+      const parsed = await res.json();
+      assert.equal(res.status, 400, `${name} 应返回 400，实际 ${res.status}`);
+      assert.equal(parsed.error, 'invalid_amount', `${name} 错误码不对`);
     }
   });
 
-  const invalidHappenedAtCases = [
-    ['ISO 字符串', '2026-11-13T04:00:00Z'],
-    ['数字字符串', String(FIXED_NOW)],
-    ['1999-12-31', Date.UTC(1999, 11, 31, 23, 59, 59)],
-    ['2000-01-01 前 1ms', Date.UTC(2000, 0, 1) - 1],
-    ['未来 10 分钟', FIXED_NOW + 10 * 60_000],
-    ['未来 5 分钟 + 1ms', FIXED_NOW + 5 * 60_000 + 1],
-    ['小数时间戳', 1_763_000_000_000.5],
-    ['布尔值', true],
-  ];
-  for (const [label, happenedAt] of invalidHappenedAtCases) {
-    test(`happenedAt 非法（${label}）→ 400 invalid_happened_at`, async () => {
-      const result = await postJson(ctx.baseUrl, '/api/feedings', {
-        feedType: 'formula',
-        amountMl: 120,
-        happenedAt,
-      });
-      assertApiError(result, 400, 'invalid_happened_at');
-    });
-  }
-
-  const invalidNoteCases = [
-    ['201 字符', 'a'.repeat(201)],
-    ['前后空格 + 201 字符', `  ${'a'.repeat(201)}  `],
-    ['数字', 120],
-    ['对象', { text: 'x' }],
-    ['数组', ['x']],
-    ['布尔', true],
-  ];
-  for (const [label, note] of invalidNoteCases) {
-    test(`note 非法（${label}）→ 400 invalid_note`, async () => {
-      const result = await postJson(ctx.baseUrl, '/api/feedings', {
-        feedType: 'formula',
-        amountMl: 120,
-        note,
-      });
-      assertApiError(result, 400, 'invalid_note');
-    });
-  }
-
-  const invalidJsonCases = [
-    ['空 body', ''],
-    ['纯空白', '   '],
-    ['坏 JSON {', '{'],
-    ['数组 [1,2]', '[1,2]'],
-    ['JSON null', 'null'],
-    ['数字 42', '42'],
-    ['布尔 true', 'true'],
-  ];
-  for (const [label, body] of invalidJsonCases) {
-    test(`请求体非法 JSON（${label}）→ 400 invalid_json`, async () => {
-      const result = await postRaw(ctx.baseUrl, '/api/feedings', body);
-      assertApiError(result, 400, 'invalid_json');
-    });
-  }
-
-  test('Content-Type 非 application/json → 415 unsupported_media_type', async () => {
-    for (const contentType of ['text/plain', 'application/x-www-form-urlencoded']) {
-      const result = await postRaw(ctx.baseUrl, '/api/feedings', JSON.stringify({ feedType: 'formula', amountMl: 120 }), contentType);
-      assertApiError(result, 415, 'unsupported_media_type');
+  test('unexpected_amount：仅亲喂带任何非 null 奶量都不允许', async (t) => {
+    const { url } = await startApp(t);
+    const cases = [
+      { feedTypes: ['breast_direct'], amountMl: 120 },
+      { feedTypes: ['breast_direct'], amountMl: 0 },
+      { feedType: 'breast_direct', amountMl: 90 },
+    ];
+    for (const body of cases) {
+      const res = await postFeeding(url, body);
+      await assertError(res, 400, 'unexpected_amount');
     }
   });
 
-  test('请求体超过 64KB → 413 payload_too_large', async () => {
-    const body = JSON.stringify({ feedType: 'formula', amountMl: 120, note: 'a'.repeat(70_000) });
-    const result = await postRaw(ctx.baseUrl, '/api/feedings', body);
-    assertApiError(result, 413, 'payload_too_large');
+  test('invalid_happened_at：字符串 / 太早 / 未来超过 5 分钟 / 小数 / 布尔', async (t) => {
+    const { url } = await startApp(t);
+    const cases = [
+      ['字符串', '昨天'],
+      ['太早（1999）', Date.UTC(1999, 11, 31, 23, 59, 59)],
+      ['未来 5 分钟 + 1ms', NOW + 5 * MINUTE + 1],
+      ['小数', 1.5],
+      ['布尔', true],
+      ['负数', -1000],
+    ];
+    for (const [name, happenedAt] of cases) {
+      const res = await postFeeding(url, { feedTypes: ['formula'], amountMl: 120, happenedAt });
+      const parsed = await res.json();
+      assert.equal(res.status, 400, `${name} 应返回 400`);
+      assert.equal(parsed.error, 'invalid_happened_at', `${name} 错误码不对`);
+    }
+  });
+
+  test('invalid_note：超过 200 字符 / 非字符串', async (t) => {
+    const { url } = await startApp(t);
+    const cases = [
+      ['201 字符', 'x'.repeat(201)],
+      ['201 字符（带空格）', `  ${'x'.repeat(201)}  `],
+      ['数字', 123],
+      ['对象', { text: 'hi' }],
+      ['数组', ['hi']],
+    ];
+    for (const [name, note] of cases) {
+      const res = await postFeeding(url, { feedTypes: ['formula'], amountMl: 120, note });
+      const parsed = await res.json();
+      assert.equal(res.status, 400, `${name} 应返回 400`);
+      assert.equal(parsed.error, 'invalid_note', `${name} 错误码不对`);
+    }
+  });
+
+  test('invalid_json：空 body / 坏 JSON / 数组 / null / 字符串 / 数字', async (t) => {
+    const { url } = await startApp(t);
+    const cases = [
+      ['空 body', ''],
+      ['空白 body', '   '],
+      ['坏 JSON', '{"feedTypes":['],
+      ['数组', '[]'],
+      ['null', 'null'],
+      ['字符串', '"formula"'],
+      ['数字', '42'],
+      ['布尔', 'true'],
+    ];
+    for (const [name, raw] of cases) {
+      const res = await postFeeding(url, raw);
+      const parsed = await res.json();
+      assert.equal(res.status, 400, `${name} 应返回 400`);
+      assert.equal(parsed.error, 'invalid_json', `${name} 错误码不对`);
+    }
+  });
+
+  test('415：非 application/json / 缺 Content-Type', async (t) => {
+    const { url } = await startApp(t);
+
+    const textPlain = await fetch(`${url}/api/feedings`, {
+      method: 'POST',
+      headers: { 'content-type': 'text/plain' },
+      body: JSON.stringify({ feedTypes: ['formula'], amountMl: 120 }),
+    });
+    await assertError(textPlain, 415, 'unsupported_media_type');
+
+    const form = await fetch(`${url}/api/feedings`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/x-www-form-urlencoded' },
+      body: 'feedType=formula',
+    });
+    await assertError(form, 415, 'unsupported_media_type');
+
+    // fetch 对字符串 body 自动加 text/plain → 415
+    const noHeader = await fetch(`${url}/api/feedings`, {
+      method: 'POST',
+      body: JSON.stringify({ feedTypes: ['formula'], amountMl: 120 }),
+    });
+    await assertError(noHeader, 415, 'unsupported_media_type');
+  });
+
+  test('413：请求体超过 64KB', async (t) => {
+    const { url } = await startApp(t);
+    const big = JSON.stringify({ feedTypes: ['formula'], amountMl: 120, note: 'x'.repeat(70 * 1024) });
+    assert.ok(Buffer.byteLength(big) > 64 * 1024);
+    const res = await postFeeding(url, big);
+    await assertError(res, 413, 'payload_too_large');
   });
 });
 
@@ -431,65 +443,71 @@ describe('POST /api/feedings', () => {
 // ---------------------------------------------------------------------------
 
 describe('POST /api/diapers', () => {
-  let ctx;
-  before(async () => {
-    ctx = await startApp();
-  });
-  after(async () => {
-    if (ctx) await ctx.stop();
-  });
-
-  for (const diaperKind of ['pee', 'poop', 'mixed']) {
-    test(`${diaperKind} 成功：201 且事件字段形状正确`, async () => {
-      const happenedAt = shanghai(8, 0);
-      const result = await postJson(ctx.baseUrl, '/api/diapers', { diaperKind, happenedAt, note: ' 有点稀 ' });
-      assert.equal(result.status, 201);
-      assert.deepEqual(result.json.event, {
-        id: result.json.event.id,
-        kind: 'diaper',
-        feedType: null,
-        amountMl: null,
-        diaperKind,
-        note: '有点稀',
-        happenedAt,
-        createdAt: FIXED_NOW,
-      });
-    });
-  }
-
-  test('happenedAt 省略时默认服务器当前时间；note 省略为 null', async () => {
-    const result = await postJson(ctx.baseUrl, '/api/diapers', { diaperKind: 'pee' });
-    assert.equal(result.status, 201);
-    assert.equal(result.json.event.happenedAt, FIXED_NOW);
-    assert.equal(result.json.event.note, null);
+  test('三种类型均成功，事件字段正确', async (t) => {
+    const { url } = await startApp(t);
+    const cases = [
+      { diaperKind: 'pee', happenedAt: NOW - 3 * HOUR, note: null },
+      { diaperKind: 'poop', happenedAt: NOW - 2 * HOUR, note: '拉臭臭' },
+      { diaperKind: 'mixed', happenedAt: NOW - HOUR, note: ' 一次搞定 ' },
+    ];
+    for (const input of cases) {
+      const res = await postDiaper(url, input);
+      assert.equal(res.status, 201, `${input.diaperKind} 应成功`);
+      const body = await res.json();
+      assert.deepEqual(
+        body.event,
+        expectedDiaperEvent({
+          id: body.event.id,
+          diaperKind: input.diaperKind,
+          note: input.note === null ? null : input.note.trim(),
+          happenedAt: input.happenedAt,
+        }),
+      );
+    }
   });
 
-  const invalidDiaperKindCases = [
-    ['缺失 diaperKind', {}],
-    ['未知类型 wet', { diaperKind: 'wet' }],
-    ['null', { diaperKind: null }],
-    ['数字', { diaperKind: 1 }],
-    ['喂奶类型 formula', { diaperKind: 'formula' }],
-  ];
-  for (const [label, payload] of invalidDiaperKindCases) {
-    test(`diaperKind 非法（${label}）→ 400 invalid_diaper_kind`, async () => {
-      const result = await postJson(ctx.baseUrl, '/api/diapers', payload);
-      assertApiError(result, 400, 'invalid_diaper_kind');
-    });
-  }
+  test('省略 happenedAt / note 时默认 now / null', async (t) => {
+    const { url } = await startApp(t);
+    const res = await postDiaper(url, { diaperKind: 'pee' });
+    assert.equal(res.status, 201);
+    const body = await res.json();
+    assert.equal(body.event.happenedAt, NOW);
+    assert.equal(body.event.createdAt, NOW);
+    assert.equal(body.event.note, null);
+    assert.equal(body.event.kind, 'diaper');
+    assert.equal(body.event.feedTypes, null);
+    assert.equal(body.event.amountMl, null);
+  });
 
-  test('diaper 的 happenedAt / note / JSON 校验复用同一套错误码', async () => {
-    assertApiError(
-      await postJson(ctx.baseUrl, '/api/diapers', { diaperKind: 'pee', happenedAt: String(FIXED_NOW) }),
+  test('invalid_diaper_kind：缺失 / 未知 / 大小写错误 / 非字符串', async (t) => {
+    const { url } = await startApp(t);
+    for (const body of [
+      {},
+      { diaperKind: 'both' },
+      { diaperKind: 'PEE' },
+      { diaperKind: 123 },
+      { diaperKind: null },
+    ]) {
+      const res = await postDiaper(url, body);
+      await assertError(res, 400, 'invalid_diaper_kind');
+    }
+  });
+
+  test('diapers 同样校验 happenedAt / note / JSON / 415', async (t) => {
+    const { url } = await startApp(t);
+    await assertError(
+      await postDiaper(url, { diaperKind: 'pee', happenedAt: '昨天' }),
       400,
       'invalid_happened_at',
     );
-    assertApiError(
-      await postJson(ctx.baseUrl, '/api/diapers', { diaperKind: 'pee', note: 'a'.repeat(201) }),
-      400,
-      'invalid_note',
-    );
-    assertApiError(await postRaw(ctx.baseUrl, '/api/diapers', '{'), 400, 'invalid_json');
+    await assertError(await postDiaper(url, { diaperKind: 'pee', note: 'x'.repeat(201) }), 400, 'invalid_note');
+    await assertError(await postDiaper(url, '{bad json'), 400, 'invalid_json');
+    const wrongType = await fetch(`${url}/api/diapers`, {
+      method: 'POST',
+      headers: { 'content-type': 'text/plain' },
+      body: '{}',
+    });
+    await assertError(wrongType, 415, 'unsupported_media_type');
   });
 });
 
@@ -498,251 +516,265 @@ describe('POST /api/diapers', () => {
 // ---------------------------------------------------------------------------
 
 describe('GET /api/state', () => {
-  let ctx;
-  const seeded = {};
-
-  before(async () => {
-    ctx = await startApp();
-    // 东八区 2026-11-12（前一天）本地 hh:mm → epoch ms
-    const prevDay = (h, min) => Date.UTC(2026, 10, 12, h - 8, min, 0, 0);
-    const specs = [
-      ['f120', '/api/feedings', { feedType: 'formula', amountMl: 120, happenedAt: shanghai(7, 0) }],
-      ['mixed', '/api/diapers', { diaperKind: 'mixed', happenedAt: shanghai(11, 0) }],
-      ['prevFormula', '/api/feedings', { feedType: 'formula', amountMl: 500, happenedAt: prevDay(23, 0) }],
-      ['bm', '/api/feedings', { feedType: 'breast_milk', amountMl: 90, happenedAt: shanghai(9, 15) }],
-      ['pee', '/api/diapers', { diaperKind: 'pee', happenedAt: shanghai(8, 0) }],
-      ['bd', '/api/feedings', { feedType: 'breast_direct', happenedAt: shanghai(10, 30) }],
-      ['f180', '/api/feedings', { feedType: 'formula', amountMl: 180, happenedAt: shanghai(8, 30) }],
-      ['prevPee', '/api/diapers', { diaperKind: 'pee', happenedAt: prevDay(23, 30) }],
-      ['poop', '/api/diapers', { diaperKind: 'poop', happenedAt: shanghai(9, 0) }],
-    ];
-    for (const [label, pathname, payload] of specs) {
-      const result = await postJson(ctx.baseUrl, pathname, payload);
-      assert.equal(result.status, 201, `种子数据 ${label} 创建失败：${result.text}`);
-      seeded[label] = result.json.event;
-    }
-  });
-  after(async () => {
-    if (ctx) await ctx.stop();
+  test('空库：today 全 0、last* null、recent 空、now 为注入值', async (t) => {
+    const { url } = await startApp(t);
+    const res = await getJson(url, `/api/state?tzOffset=${TZ_SHANGHAI}`);
+    assert.equal(res.status, 200);
+    const state = await res.json();
+    assert.equal(state.now, NOW);
+    assert.deepEqual(state.today, {
+      date: '2026-11-13',
+      feedCount: 0,
+      totalMl: 0,
+      formulaCount: 0,
+      breastMilkCount: 0,
+      breastDirectCount: 0,
+      mixedFeedCount: 0,
+      diaperCount: 0,
+      peeCount: 0,
+      poopCount: 0,
+      mixedCount: 0,
+    });
+    assert.equal(state.lastFeeding, null);
+    assert.equal(state.lastDiaper, null);
+    assert.deepEqual(state.recent, []);
   });
 
-  test('tzOffset=-480：today 聚合、lastFeeding/lastDiaper、recent 排序全部正确', async () => {
-    const result = await apiRequest(ctx.baseUrl, `/api/state?tzOffset=${TZ_SHANGHAI}`);
-    assert.equal(result.status, 200);
-    const state = result.json;
+  test('tzOffset=-480：POST 写入后聚合 / last* / recent 正确', async (t) => {
+    const { url } = await startApp(t);
+    const sh = (hour, minute = 0) => Date.UTC(2026, 10, 13, hour - 8, minute, 0, 0);
 
-    assert.equal(state.now, FIXED_NOW);
+    const created = [];
+    created.push((await (await postFeeding(url, { feedTypes: ['formula'], amountMl: 120, happenedAt: sh(0) })).json()).event);
+    created.push((await (await postFeeding(url, { feedTypes: ['breast_milk'], amountMl: 90, happenedAt: sh(7, 30) })).json()).event);
+    created.push((await (await postFeeding(url, { feedTypes: ['breast_direct'], happenedAt: sh(8) })).json()).event);
+    created.push(
+      (await (await postFeeding(url, { feedTypes: ['formula', 'breast_direct'], amountMl: 60, happenedAt: sh(9) })).json()).event,
+    );
+    created.push((await (await postDiaper(url, { diaperKind: 'pee', happenedAt: sh(10) })).json()).event);
+    created.push((await (await postDiaper(url, { diaperKind: 'mixed', happenedAt: sh(10, 30) })).json()).event);
+    created.push((await (await postDiaper(url, { diaperKind: 'poop', happenedAt: sh(11) })).json()).event);
+
+    const state = await (await getJson(url, `/api/state?tzOffset=${TZ_SHANGHAI}`)).json();
+    assert.equal(state.now, NOW);
     assert.deepEqual(state.today, {
       date: '2026-11-13',
       feedCount: 4,
-      breastDirectCount: 1,
-      formulaMl: 300,
-      breastMl: 90,
-      totalMl: 390,
-      diaperCount: 3,
-      peeCount: 2, // pee + mixed
-      poopCount: 2, // poop + mixed
-      mixedCount: 1,
-    });
-
-    assert.equal(state.lastFeeding.id, seeded.bd.id, 'lastFeeding 应是最近一条 feed（含亲喂）');
-    assert.equal(state.lastFeeding.feedType, 'breast_direct');
-    assert.equal(state.lastDiaper.id, seeded.mixed.id, 'lastDiaper 应是最近一条 diaper');
-    assert.equal(state.lastDiaper.diaperKind, 'mixed');
-
-    const expectedRecentIds = ['mixed', 'bd', 'bm', 'poop', 'f180', 'pee', 'f120', 'prevPee', 'prevFormula'].map(
-      (label) => seeded[label].id,
-    );
-    assert.deepEqual(state.recent.map((event) => event.id), expectedRecentIds);
-    for (let i = 1; i < state.recent.length; i += 1) {
-      const previous = state.recent[i - 1];
-      const current = state.recent[i];
-      assert.ok(
-        previous.happenedAt > current.happenedAt ||
-          (previous.happenedAt === current.happenedAt && previous.id > current.id),
-        `recent 排序错误（index ${i}）`,
-      );
-    }
-  });
-
-  test('tzOffset=0：只统计 UTC 当天的事件', async () => {
-    const result = await apiRequest(ctx.baseUrl, '/api/state?tzOffset=0');
-    assert.equal(result.status, 200);
-    assert.equal(result.json.today.date, '2026-11-13');
-    assert.deepEqual(result.json.today, {
-      date: '2026-11-13',
-      feedCount: 3, // f180 / bm / bd（东八区上午 = UTC 同日 00:00–03:00）
-      breastDirectCount: 1,
-      formulaMl: 180,
-      breastMl: 90,
       totalMl: 270,
+      formulaCount: 2,
+      breastMilkCount: 1,
+      breastDirectCount: 2,
+      mixedFeedCount: 1,
       diaperCount: 3,
       peeCount: 2,
       poopCount: 2,
       mixedCount: 1,
     });
+    assert.deepEqual(state.lastFeeding, created[3]);
+    assert.deepEqual(state.lastDiaper, created[6]);
+    assert.equal(state.recent.length, 7);
+    assert.deepEqual(
+      state.recent.map((event) => event.id),
+      [created[6].id, created[5].id, created[4].id, created[3].id, created[2].id, created[1].id, created[0].id],
+    );
   });
 
-  test('省略 tzOffset → 200，按服务器本地时区返回结构完整的数据', async () => {
-    const result = await apiRequest(ctx.baseUrl, '/api/state');
-    assert.equal(result.status, 200);
-    const state = result.json;
-    assert.equal(state.now, FIXED_NOW);
-    assert.match(state.today.date, /^\d{4}-\d{2}-\d{2}$/);
-    assert.equal(state.today.totalMl, state.today.formulaMl + state.today.breastMl);
-    assert.ok(state.today.feedCount >= state.today.breastDirectCount);
-    assert.ok(state.today.diaperCount >= state.today.mixedCount);
-    assert.equal(state.recent.length, 9);
-    assert.equal(state.lastFeeding.id, seeded.bd.id);
-    assert.equal(state.lastDiaper.id, seeded.mixed.id);
+  test('tzOffset=0：按 UTC 当天窗口聚合', async (t) => {
+    const { url, app } = await startApp(t);
+    seedFeed(app.store, Date.UTC(2026, 10, 13, 0, 0) - 1, ['formula'], 10); // UTC 前一天
+    seedFeed(app.store, Date.UTC(2026, 10, 13, 0, 0), ['formula'], 20); // UTC 当天 00:00
+    seedFeed(app.store, Date.UTC(2026, 10, 13, 1, 0), ['formula'], 30); // UTC 当天
+    seedFeed(app.store, Date.UTC(2026, 10, 14, 0, 0), ['formula'], 40); // UTC 后一天
+
+    const state = await (await getJson(url, '/api/state?tzOffset=0')).json();
+    assert.equal(state.today.date, '2026-11-13');
+    assert.equal(state.today.feedCount, 2);
+    assert.equal(state.today.totalMl, 50);
   });
 
-  test('tzOffset 非法 → 400 invalid_tz_offset', async () => {
-    for (const raw of ['-841', '841', 'abc', '1.5', '', '-480.0', 'NaN']) {
-      const result = await apiRequest(ctx.baseUrl, `/api/state?tzOffset=${encodeURIComponent(raw)}`);
-      assertApiError(result, 400, 'invalid_tz_offset');
+  test('tzOffset=840 / -840：极端时区窗口与日期正确', async (t) => {
+    // UTC−14（tzOffset=840）：NOW 本地 2026-11-12 14:00
+    {
+      const { url, app } = await startApp(t);
+      const dayStart = Date.UTC(2026, 10, 12, 14, 0, 0);
+      seedFeed(app.store, dayStart - 1, ['formula'], 10);
+      seedFeed(app.store, dayStart, ['formula'], 20);
+      seedFeed(app.store, dayStart + DAY - 1, ['formula'], 30);
+      seedFeed(app.store, dayStart + DAY, ['formula'], 40);
+      const state = await (await getJson(url, '/api/state?tzOffset=840')).json();
+      assert.equal(state.today.date, '2026-11-12');
+      assert.equal(state.today.feedCount, 2);
+      assert.equal(state.today.totalMl, 50);
+    }
+    // UTC+14（tzOffset=-840）：NOW 本地 2026-11-13 18:00
+    {
+      const { url, app } = await startApp(t);
+      const dayStart = Date.UTC(2026, 10, 12, 10, 0, 0);
+      seedFeed(app.store, dayStart - 1, ['formula'], 10);
+      seedFeed(app.store, dayStart, ['formula'], 20);
+      seedFeed(app.store, dayStart + DAY - 1, ['formula'], 30);
+      seedFeed(app.store, dayStart + DAY, ['formula'], 40);
+      const state = await (await getJson(url, '/api/state?tzOffset=-840')).json();
+      assert.equal(state.today.date, '2026-11-13');
+      assert.equal(state.today.feedCount, 2);
+      assert.equal(state.today.totalMl, 50);
     }
   });
 
-  test('tzOffset 合法边界 -840 / 840 / 480 → 200', async () => {
-    for (const raw of ['-840', '840', '480', '0', '-0']) {
-      const result = await apiRequest(ctx.baseUrl, `/api/state?tzOffset=${raw}`);
-      assert.equal(result.status, 200, `tzOffset=${raw} 应合法，body=${result.text}`);
-      assert.match(result.json.today.date, /^\d{4}-\d{2}-\d{2}$/);
+  test('省略 tzOffset：使用服务器本地时区', async (t) => {
+    const { url, app } = await startApp(t);
+    const d = new Date(NOW);
+    const localStart = new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
+    const localEnd = new Date(d.getFullYear(), d.getMonth(), d.getDate() + 1).getTime();
+    seedFeed(app.store, localStart - 1, ['formula'], 10);
+    seedFeed(app.store, localStart, ['formula'], 20);
+    seedFeed(app.store, localEnd - 1, ['formula'], 30);
+    seedFeed(app.store, localEnd, ['formula'], 40);
+
+    const state = await (await getJson(url, '/api/state')).json();
+    const expectedDate = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(
+      d.getDate(),
+    ).padStart(2, '0')}`;
+    assert.equal(state.today.date, expectedDate);
+    assert.equal(state.today.feedCount, 2);
+    assert.equal(state.today.totalMl, 50);
+  });
+
+  test('非法 tzOffset → 400 invalid_tz_offset', async (t) => {
+    const { url } = await startApp(t);
+    for (const raw of ['abc', '1.5', '900', '-841', '', ' 480', '+480', 'NaN']) {
+      const res = await getJson(url, `/api/state?tzOffset=${encodeURIComponent(raw)}`);
+      await assertError(res, 400, 'invalid_tz_offset');
     }
   });
 });
 
 // ---------------------------------------------------------------------------
-// GET /api/events（limit / 游标分页）
+// GET /api/events（limit 与复合游标）
 // ---------------------------------------------------------------------------
 
-describe('GET /api/events', () => {
-  let ctx;
-  const BASE_TIME = Date.UTC(2026, 10, 1, 0, 0, 0);
-  const SAME_MS_TIME = Date.UTC(2026, 10, 2, 0, 0, 0); // 比 BASE_TIME 系列都新
-  const TOTAL = 60; // 55 条时间互不相同 + 5 条同一毫秒
-  const allIdsDesc = Array.from({ length: TOTAL }, (_, index) => TOTAL - index); // [60, 59, ..., 1]
-  let sameMsIds = [];
-
-  before(async () => {
-    ctx = await startApp();
+describe('GET /api/events · limit', () => {
+  test('默认 limit=50，1 / 200 边界，排序 happenedAt DESC, id DESC', async (t) => {
+    const { url, app } = await startApp(t);
+    const base = SH_DAY_START + 60_000;
     for (let i = 0; i < 55; i += 1) {
-      const happenedAt = BASE_TIME + i * 60_000;
-      if (i % 5 === 0) {
-        ctx.app.store.createEvent({
-          kind: 'diaper',
-          diaperKind: ['pee', 'poop', 'mixed'][i % 3],
-          happenedAt,
-          createdAt: FIXED_NOW,
-        });
+      seedFeed(app.store, base + i * 1000, ['formula'], 10 + i);
+    }
+
+    const def = await (await getJson(url, '/api/events')).json();
+    assert.equal(def.events.length, 50);
+    assert.deepEqual(
+      def.events.map((event) => event.id),
+      Array.from({ length: 50 }, (_, index) => 55 - index),
+    );
+
+    const one = await (await getJson(url, '/api/events?limit=1')).json();
+    assert.equal(one.events.length, 1);
+    assert.equal(one.events[0].id, 55);
+
+    const twoHundred = await (await getJson(url, '/api/events?limit=200')).json();
+    assert.equal(twoHundred.events.length, 55);
+
+    const seven = await (await getJson(url, '/api/events?limit=7')).json();
+    assert.equal(seven.events.length, 7);
+  });
+
+  test('非法 limit → 400 invalid_limit', async (t) => {
+    const { url } = await startApp(t);
+    for (const raw of ['0', '201', '-1', 'abc', '', '1.5', '001']) {
+      // '001' 是正则接受的整数写法，值为 1，单独处理
+      const res = await getJson(url, `/api/events?limit=${raw === '' ? '' : encodeURIComponent(raw)}`);
+      if (raw === '001') {
+        assert.equal(res.status, 200, '前导零的整数写法应被接受');
+        await res.json();
       } else {
-        ctx.app.store.createEvent({
-          kind: 'feed',
-          feedType: 'formula',
-          amountMl: 60 + i,
-          happenedAt,
-          createdAt: FIXED_NOW,
-        });
+        await assertError(res, 400, 'invalid_limit');
       }
     }
-    for (let i = 0; i < 5; i += 1) {
-      sameMsIds.push(
-        ctx.app.store.createEvent({
-          kind: 'feed',
-          feedType: 'formula',
-          amountMl: 10 + i,
-          happenedAt: SAME_MS_TIME,
-          createdAt: FIXED_NOW,
-        }).id,
-      );
-    }
   });
-  after(async () => {
-    if (ctx) await ctx.stop();
-  });
+});
 
-  async function getEvents(query = '') {
-    const result = await apiRequest(ctx.baseUrl, `/api/events${query}`);
-    assert.equal(result.status, 200, result.text);
-    assert.ok(Array.isArray(result.json.events), '响应必须是 { events: [] }');
-    return result.json.events;
-  }
+describe('GET /api/events · 游标分页', () => {
+  test('只传 before 时严格 happened_at < before', async (t) => {
+    const { url, app } = await startApp(t);
+    const T = SH_DAY_START + 10_000;
+    const older = seedFeed(app.store, T - 1, ['formula'], 10);
+    const same1 = seedFeed(app.store, T, ['formula'], 20);
+    seedFeed(app.store, T, ['formula'], 30);
 
-  test('limit 默认 50，按 happenedAt DESC, id DESC', async () => {
-    const events = await getEvents();
-    assert.equal(events.length, 50);
-    assert.deepEqual(events.map((event) => event.id), allIdsDesc.slice(0, 50));
-    assert.equal(events[50 - 1].id, 11);
-    assert.equal(events[50 - 1].happenedAt, BASE_TIME + 10 * 60_000);
+    const strict = await (await getJson(url, `/api/events?before=${T}`)).json();
+    assert.deepEqual(strict.events.map((event) => event.id), [older.id]);
+    assert.ok(strict.events.every((event) => event.happenedAt < T));
+
+    const inclusiveLook = await (await getJson(url, `/api/events?before=${T + 1}`)).json();
+    assert.equal(inclusiveLook.events.length, 3);
+    assert.equal(inclusiveLook.events[0].happenedAt, T);
+    assert.equal(inclusiveLook.events[0].id, same1.id + 1);
   });
 
-  test('limit 自定义 1 / 3 / 200', async () => {
-    assert.deepEqual((await getEvents('?limit=1')).map((event) => event.id), [60]);
-    assert.deepEqual((await getEvents('?limit=3')).map((event) => event.id), [60, 59, 58]);
-    assert.equal((await getEvents('?limit=200')).length, TOTAL);
-  });
+  test('复合游标（before + beforeId）同毫秒翻页不丢不重', async (t) => {
+    const { url, app } = await startApp(t);
+    const T = SH_DAY_START + 20_000;
+    const created = [];
+    // 同毫秒 5 条 + 相邻毫秒若干，混合排序
+    for (let i = 0; i < 5; i += 1) created.push(seedFeed(app.store, T, ['formula'], 10 + i));
+    created.push(seedFeed(app.store, T - 1, ['formula'], 100));
+    created.push(seedFeed(app.store, T + 1, ['formula'], 200));
 
-  const invalidLimitCases = ['0', '201', '-1', 'abc', '1.5', ''];
-  for (const raw of invalidLimitCases) {
-    test(`limit 非法（${JSON.stringify(raw)}）→ 400 invalid_limit`, async () => {
-      const result = await apiRequest(ctx.baseUrl, `/api/events?limit=${raw}`);
-      assertApiError(result, 400, 'invalid_limit');
-    });
-  }
-
-  test('游标翻页（limit=7）不漏不重、顺序与全量一致', async () => {
-    const collected = [];
-    let query = '?limit=7';
+    const expectedIds = [...created].sort((a, b) => b.happenedAt - a.happenedAt || b.id - a.id).map((event) => event.id);
+    const seen = [];
+    let cursor = null;
     for (let guard = 0; guard < 20; guard += 1) {
-      const events = await getEvents(query);
-      if (events.length === 0) break;
-      collected.push(...events);
-      const last = events[events.length - 1];
-      query = `?limit=7&before=${last.happenedAt}&beforeId=${last.id}`;
+      const query = cursor
+        ? `?limit=2&before=${cursor.happenedAt}&beforeId=${cursor.id}`
+        : '?limit=2';
+      const page = await (await getJson(url, `/api/events${query}`)).json();
+      if (page.events.length === 0) break;
+      seen.push(...page.events.map((event) => event.id));
+      const last = page.events[page.events.length - 1];
+      cursor = { happenedAt: last.happenedAt, id: last.id };
     }
-    assert.deepEqual(collected.map((event) => event.id), allIdsDesc);
-    assert.equal(new Set(collected.map((event) => event.id)).size, TOTAL, '翻页结果不能有重复');
+    assert.deepEqual(seen, expectedIds, '翻页结果应完整、无重复、顺序一致');
+    assert.equal(new Set(seen).size, seen.length);
+    assert.equal(seen.length, created.length);
   });
 
-  test('同一 happenedAt 的事件跨页不丢不重（limit=2）', async () => {
-    const page1 = await getEvents('?limit=2');
-    assert.deepEqual(page1.map((event) => event.id), [60, 59]);
-    assert.equal(page1[0].happenedAt, SAME_MS_TIME);
-
-    const page2 = await getEvents(`?limit=2&before=${SAME_MS_TIME}&beforeId=${page1[1].id}`);
-    assert.deepEqual(page2.map((event) => event.id), [58, 57]);
-
-    const page3 = await getEvents(`?limit=2&before=${SAME_MS_TIME}&beforeId=${page2[1].id}`);
-    assert.deepEqual(page3.map((event) => event.id), [56, 55]);
-
-    const page4 = await getEvents(`?limit=2&before=${page3[1].happenedAt}&beforeId=${page3[1].id}`);
-    assert.deepEqual(page4.map((event) => event.id), [54, 53]);
-
-    const seen = [...page1, ...page2, ...page3, ...page4].map((event) => event.id);
-    assert.equal(new Set(seen).size, seen.length, '跨页不能出现重复事件');
-    assert.deepEqual(seen, allIdsDesc.slice(0, 8));
+  test('复合游标同毫秒：id 严格小于 beforeId', async (t) => {
+    const { url, app } = await startApp(t);
+    const T = SH_DAY_START + 30_000;
+    const events = [];
+    for (let i = 0; i < 4; i += 1) events.push(seedDiaper(app.store, T, 'pee'));
+    const third = events[2];
+    const page = await (await getJson(url, `/api/events?before=${T}&beforeId=${third.id}`)).json();
+    assert.deepEqual(
+      page.events.map((event) => event.id),
+      [events[1].id, events[0].id],
+    );
+    assert.ok(page.events.every((event) => event.id < third.id));
   });
 
-  test('只传 before（不传 beforeId）→ happenedAt 严格小于 before', async () => {
-    const events = await getEvents(`?before=${SAME_MS_TIME}&limit=200`);
-    assert.equal(events.length, 55);
-    assert.deepEqual(events.map((event) => event.id), Array.from({ length: 55 }, (_, index) => 55 - index));
-    assert.ok(events.every((event) => event.happenedAt < SAME_MS_TIME));
-  });
-
-  test('before + beforeId → 返回严格更旧的数据（同毫秒按 id 比较）', async () => {
-    const events = await getEvents(`?before=${SAME_MS_TIME}&beforeId=${sameMsIds[3]}&limit=200`);
-    assert.deepEqual(events.slice(0, 3).map((event) => event.id), [58, 57, 56]);
-    assert.equal(events.length, 58);
-    assert.ok(!events.some((event) => event.id >= sameMsIds[3]));
-  });
-
-  test('非法游标 → 400 invalid_cursor', async () => {
-    for (const query of ['?before=abc', '?before=', '?before=-1', `?before=${SAME_MS_TIME}&beforeId=abc`, `?before=${SAME_MS_TIME}&beforeId=`]) {
-      const result = await apiRequest(ctx.baseUrl, `/api/events${query}`);
-      assertApiError(result, 400, 'invalid_cursor');
+  test('非法游标 → 400 invalid_cursor；beforeId 单独出现时忽略', async (t) => {
+    const { url } = await startApp(t);
+    for (const query of [
+      '?before=abc',
+      '?before=-1',
+      '?before=1.5',
+      `?before=${SH_DAY_START}&beforeId=x`,
+      `?before=${SH_DAY_START}&beforeId=-2`,
+    ]) {
+      const res = await getJson(url, `/api/events${query}`);
+      await assertError(res, 400, 'invalid_cursor');
     }
+    const ignored = await getJson(url, '/api/events?beforeId=5');
+    assert.equal(ignored.status, 200);
+    assert.deepEqual((await ignored.json()).events, []);
+  });
+
+  test('before 早于所有记录时返回空数组', async (t) => {
+    const { url, app } = await startApp(t);
+    seedFeed(app.store, SH_DAY_START + 1000, ['formula'], 10);
+    const page = await (await getJson(url, '/api/events?before=1')).json();
+    assert.deepEqual(page.events, []);
   });
 });
 
@@ -751,242 +783,369 @@ describe('GET /api/events', () => {
 // ---------------------------------------------------------------------------
 
 describe('DELETE /api/events/:id', () => {
-  let ctx;
-  before(async () => {
-    ctx = await startApp();
-  });
-  after(async () => {
-    if (ctx) await ctx.stop();
-  });
+  test('204 删除成功，再次删除 404，state 同步更新', async (t) => {
+    const { url } = await startApp(t);
+    const created = await (
+      await postFeeding(url, { feedTypes: ['formula'], amountMl: 120, happenedAt: NOW - HOUR })
+    ).json();
+    const id = created.event.id;
 
-  async function createFeed(amountMl = 120) {
-    const result = await postJson(ctx.baseUrl, '/api/feedings', {
-      feedType: 'formula',
-      amountMl,
-      happenedAt: shanghai(9, 0),
-    });
-    assert.equal(result.status, 201, result.text);
-    return result.json.event;
-  }
+    const del = await fetch(`${url}/api/events/${id}`, { method: 'DELETE' });
+    assert.equal(del.status, 204);
+    assert.equal(await del.text(), '');
 
-  test('删除存在的事件 → 204 无响应体，再查列表不含该记录', async () => {
-    const event = await createFeed();
-    const deleted = await apiRequest(ctx.baseUrl, `/api/events/${event.id}`, { method: 'DELETE' });
-    assert.equal(deleted.status, 204);
-    assert.equal(deleted.text, '');
+    const after = await (await getJson(url, '/api/events')).json();
+    assert.deepEqual(after.events, []);
 
-    const list = await apiRequest(ctx.baseUrl, '/api/events?limit=200');
-    assert.equal(list.status, 200);
-    assert.ok(!list.json.events.some((item) => item.id === event.id));
-    assert.equal(list.json.events.length, 0);
+    await assertError(await fetch(`${url}/api/events/${id}`, { method: 'DELETE' }), 404, 'not_found');
+    await assertError(await fetch(`${url}/api/events/999999`, { method: 'DELETE' }), 404, 'not_found');
+
+    const state = await (await getJson(url, `/api/state?tzOffset=${TZ_SHANGHAI}`)).json();
+    assert.equal(state.today.feedCount, 0);
+    assert.equal(state.today.totalMl, 0);
+    assert.equal(state.lastFeeding, null);
+    assert.deepEqual(state.recent, []);
   });
 
-  test('重复删除 / 删除不存在的事件 → 404 not_found', async () => {
-    const event = await createFeed(90);
-    const first = await apiRequest(ctx.baseUrl, `/api/events/${event.id}`, { method: 'DELETE' });
-    assert.equal(first.status, 204);
-    const second = await apiRequest(ctx.baseUrl, `/api/events/${event.id}`, { method: 'DELETE' });
-    assertApiError(second, 404, 'not_found');
+  test('只删除目标记录，其他记录保留', async (t) => {
+    const { url } = await startApp(t);
+    const e1 = (await (await postFeeding(url, { feedTypes: ['formula'], amountMl: 10, happenedAt: NOW - 2 * HOUR })).json()).event;
+    const e2 = (await (await postFeeding(url, { feedTypes: ['breast_milk'], amountMl: 20, happenedAt: NOW - HOUR })).json()).event;
 
-    assertApiError(await apiRequest(ctx.baseUrl, '/api/events/99999', { method: 'DELETE' }), 404, 'not_found');
+    assert.equal((await fetch(`${url}/api/events/${e1.id}`, { method: 'DELETE' })).status, 204);
+    const { events } = await (await getJson(url, '/api/events')).json();
+    assert.deepEqual(events.map((event) => event.id), [e2.id]);
   });
 
-  test('非法 id 格式 → 404 JSON not_found（不泄露路由细节）', async () => {
-    for (const badId of ['abc', '0', '-1', '1.5', '01', '99999999999999999999']) {
-      const result = await apiRequest(ctx.baseUrl, `/api/events/${badId}`, { method: 'DELETE' });
-      assertApiError(result, 404, 'not_found');
-      assert.match(result.headers.get('content-type') ?? '', /^application\/json/);
+  test('非法 id / 非 DELETE 方法', async (t) => {
+    const { url } = await startApp(t);
+    for (const pathname of ['/api/events/abc', '/api/events/0', '/api/events/-1', '/api/events/1.5', '/api/events/99999999999999999']) {
+      const res = await fetch(`${url}${pathname}`, { method: 'DELETE' });
+      assert.equal(res.status, 404, `${pathname} 应 404`);
+      assert.equal((await res.json()).error, 'not_found');
     }
-  });
-
-  test('只删除指定事件，其余记录保留', async () => {
-    const keepA = await createFeed(60);
-    const remove = await createFeed(120);
-    const keepB = await createFeed(180);
-
-    const deleted = await apiRequest(ctx.baseUrl, `/api/events/${remove.id}`, { method: 'DELETE' });
-    assert.equal(deleted.status, 204);
-
-    const list = await apiRequest(ctx.baseUrl, '/api/events?limit=200');
-    const ids = list.json.events.map((event) => event.id);
-    assert.ok(ids.includes(keepA.id));
-    assert.ok(ids.includes(keepB.id));
-    assert.ok(!ids.includes(remove.id));
+    // 已有 id 但用 POST → 405
+    const created = await (await postFeeding(url, { feedTypes: ['formula'], amountMl: 10 })).json();
+    const res = await postJson(url, `/api/events/${created.event.id}`, {});
+    await assertError(res, 405, 'method_not_allowed');
   });
 });
 
 // ---------------------------------------------------------------------------
-// GET /api/export.csv
+// CSV 导出
 // ---------------------------------------------------------------------------
+
+/** 极简 CSV 解析（支持引号、转义双引号、单元格内换行；CRLF 行分隔） */
+function parseCsv(text) {
+  const rows = [];
+  let row = [];
+  let field = '';
+  let inQuotes = false;
+  for (let i = 0; i < text.length; i += 1) {
+    const ch = text[i];
+    if (inQuotes) {
+      if (ch === '"') {
+        if (text[i + 1] === '"') {
+          field += '"';
+          i += 1;
+        } else {
+          inQuotes = false;
+        }
+      } else {
+        field += ch;
+      }
+    } else if (ch === '"') {
+      inQuotes = true;
+    } else if (ch === ',') {
+      row.push(field);
+      field = '';
+    } else if (ch === '\r') {
+      // 行分隔符的一部分，忽略
+    } else if (ch === '\n') {
+      row.push(field);
+      rows.push(row);
+      row = [];
+      field = '';
+    } else {
+      field += ch;
+    }
+  }
+  if (field !== '' || row.length > 0) {
+    row.push(field);
+    rows.push(row);
+  }
+  return rows;
+}
 
 describe('GET /api/export.csv', () => {
-  let ctx;
-  before(async () => {
-    ctx = await startApp();
-    // 故意按乱序插入，验证导出按 happenedAt 升序排序
-    const specs = [
-      ['/api/feedings', { feedType: 'breast_direct', happenedAt: shanghai(11, 0), note: 'n-bd' }],
-      ['/api/feedings', { feedType: 'formula', amountMl: 120, happenedAt: shanghai(8, 0) }],
-      ['/api/diapers', { diaperKind: 'mixed', happenedAt: shanghai(10, 0), note: 'n-mixed' }],
-      ['/api/feedings', { feedType: 'breast_milk', amountMl: 90, happenedAt: shanghai(9, 0), note: 'n-bm' }],
-      ['/api/diapers', { diaperKind: 'pee', happenedAt: shanghai(9, 30), note: 'n-pee' }],
-      ['/api/feedings', { feedType: 'formula', amountMl: 60, happenedAt: shanghai(8, 30), note: 'he said "hi", ok' }],
-    ];
-    for (const [pathname, payload] of specs) {
-      const result = await postJson(ctx.baseUrl, pathname, payload);
-      assert.equal(result.status, 201, result.text);
-    }
-  });
-  after(async () => {
-    if (ctx) await ctx.stop();
-  });
+  test('BOM / 表头 / 多标签项目名 / 转义 / 升序 / 响应头', async (t) => {
+    const { url } = await startApp(t);
+    // 乱序写入，验证按 happenedAt ASC
+    const t0 = NOW - 5 * HOUR;
+    const t1 = NOW - 4 * HOUR;
+    const t2 = NOW - 3 * HOUR;
+    const t3 = NOW - 2 * HOUR;
+    const t4 = NOW - HOUR;
 
-  test('200 + BOM + 表头 + CSV 响应头（含本地日期文件名）', async () => {
-    const { response, buffer, text } = await getCsv(ctx.baseUrl);
-    assert.equal(response.status, 200);
-    assert.equal(response.headers.get('content-type'), 'text/csv; charset=utf-8');
+    await postFeeding(url, { feedTypes: ['formula', 'breast_milk'], amountMl: 120, note: '夜里那次', happenedAt: t2 });
+    await postFeeding(url, { feedTypes: ['formula'], amountMl: 60, note: '早些, 有"引号"', happenedAt: t0 });
+    await postDiaper(url, { diaperKind: 'mixed', note: '换尿布', happenedAt: t3 });
+    await postFeeding(url, { feedTypes: ['breast_direct'], happenedAt: t1 });
+    await postFeeding(url, {
+      feedTypes: ['breast_direct', 'formula'],
+      amountMl: 45,
+      note: '第一行, 和"引号"\n第二行',
+      happenedAt: t4,
+    });
+
+    const res = await fetch(`${url}/api/export.csv`);
+    assert.equal(res.status, 200);
+    assert.equal(res.headers.get('content-type'), 'text/csv; charset=utf-8');
+    assert.equal(res.headers.get('cache-control'), 'no-store');
+    assert.equal(res.headers.get('x-content-type-options'), 'nosniff');
+
+    const localDate = `${new Date(NOW).getFullYear()}-${String(new Date(NOW).getMonth() + 1).padStart(2, '0')}-${String(
+      new Date(NOW).getDate(),
+    ).padStart(2, '0')}`;
     assert.equal(
-      response.headers.get('content-disposition'),
-      `attachment; filename="baby-milk-${localDateKey(FIXED_NOW)}.csv"`,
+      res.headers.get('content-disposition'),
+      `attachment; filename="baby-milk-${localDate}.csv"`,
     );
-    assert.deepEqual([...buffer.subarray(0, 3)], [0xef, 0xbb, 0xbf], 'CSV 必须以 UTF-8 BOM 开头');
-    assert.equal(text.charCodeAt(0), 0xfeff);
 
-    const body = text.slice(1); // 去掉 BOM 再按行断言
-    const lines = body.split('\r\n').filter((line) => line !== '');
-    assert.equal(lines[0], '时间,类别,项目,奶量(ml),备注');
-    assert.equal(lines.length, 7, `应为表头 + 6 条数据，实际：${JSON.stringify(lines)}`);
+    const buffer = Buffer.from(await res.arrayBuffer());
+    assert.ok(buffer.length > 3);
+    assert.deepEqual([...buffer.subarray(0, 3)], [0xef, 0xbb, 0xbf], 'CSV 应以 UTF-8 BOM 开头');
+
+    const text = buffer.toString('utf8').replace(/^\uFEFF/, '');
+    const rows = parseCsv(text).filter((row) => row.length > 1 || row[0] !== '');
+    assert.deepEqual(rows[0], ['时间', '类别', '项目', '奶量(ml)', '备注']);
+    const dataRows = rows.slice(1);
+    assert.equal(dataRows.length, 5, '应有 5 条数据行');
+
+    for (const row of dataRows) {
+      assert.equal(row.length, 5, `每行应有 5 列: ${JSON.stringify(row)}`);
+      assert.match(row[0], /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$/, '时间格式应为 YYYY-MM-DD HH:mm');
+    }
+
+    // 升序：时间列字符串可直接比较（同格式）
+    for (let i = 1; i < dataRows.length; i += 1) {
+      assert.ok(dataRows[i - 1][0] <= dataRows[i][0], 'CSV 应按时间升序');
+    }
+
+    // 按时间升序：t0 奶粉 60 → t1 亲喂 → t2 奶粉+母乳 120 → t3 大小便 → t4 奶粉+亲喂 45
+    assert.deepEqual(
+      dataRows.map((row) => row.slice(1)),
+      [
+        ['喂奶', '奶粉', '60', '早些, 有"引号"'],
+        ['喂奶', '亲喂', '', ''],
+        ['喂奶', '奶粉 + 母乳（瓶喂）', '120', '夜里那次'],
+        ['大小便', '大小便', '', '换尿布'],
+        ['喂奶', '奶粉 + 亲喂', '45', '第一行, 和"引号"\n第二行'],
+      ],
+    );
+
+    // 原始文本中引号按 RFC4180 双写
+    assert.ok(text.includes('"早些, 有""引号"""'), '含逗号/引号单元格应用双引号包裹并双写引号');
+    assert.ok(text.includes('\r\n'), '行分隔符应为 CRLF');
   });
 
-  test('中文项目名 / 奶量 / 备注转义 / 本地时间格式正确，且按时间升序', async () => {
-    const { text } = await getCsv(ctx.baseUrl);
-    const lines = text.split('\r\n').filter((line) => line !== '');
-
-    assert.equal(lines[1], `${localStamp(shanghai(8, 0))},喂奶,奶粉,120,`);
-    assert.equal(lines[2], `${localStamp(shanghai(8, 30))},喂奶,奶粉,60,"he said ""hi"", ok"`);
-    assert.equal(lines[3], `${localStamp(shanghai(9, 0))},喂奶,母乳（瓶喂）,90,n-bm`);
-    assert.equal(lines[4], `${localStamp(shanghai(9, 30))},大小便,小便,,n-pee`);
-    assert.equal(lines[5], `${localStamp(shanghai(10, 0))},大小便,大小便,,n-mixed`);
-    assert.equal(lines[6], `${localStamp(shanghai(11, 0))},喂奶,亲喂,,n-bd`);
-
-    // 升序校验：YYYY-MM-DD HH:mm 字符串顺序即时间顺序
-    const stamps = lines.slice(1).map((line) => line.slice(0, 16));
-    assert.deepEqual(stamps, [...stamps].sort());
-    assert.match(lines[1], /^\d{4}-\d{2}-\d{2} \d{2}:\d{2},/);
+  test('空库：仅 BOM + 表头', async (t) => {
+    const { url } = await startApp(t);
+    const res = await fetch(`${url}/api/export.csv`);
+    assert.equal(res.status, 200);
+    const buffer = Buffer.from(await res.arrayBuffer());
+    assert.deepEqual([...buffer.subarray(0, 3)], [0xef, 0xbb, 0xbf]);
+    const text = buffer.toString('utf8').replace(/^\uFEFF/, '');
+    assert.equal(text, '时间,类别,项目,奶量(ml),备注\r\n');
   });
 });
 
 // ---------------------------------------------------------------------------
-// 静态文件
+// CORS
 // ---------------------------------------------------------------------------
 
-describe('静态文件托管', () => {
-  let ctx;
-  let rootDir;
-  const publicDirFiles = {
-    'index.html': '<!doctype html><html><body><h1>奶记</h1></body></html>',
-    'app.js': 'console.log("app");\n',
-    'style.css': 'body { color: #333; }\n',
-    'icon.svg': '<svg xmlns="http://www.w3.org/2000/svg"></svg>',
-    'manifest.webmanifest': '{"name":"奶记"}',
-  };
+describe('CORS', () => {
+  test('默认 *：API 响应带 Access-Control-Allow-Origin: *（带不带 Origin 都行）', async (t) => {
+    const { url } = await startApp(t);
+    const withOrigin = await fetch(`${url}/api/health`, { headers: { Origin: 'http://x.test' } });
+    assert.equal(withOrigin.headers.get('access-control-allow-origin'), '*');
 
-  before(async () => {
-    rootDir = await mkdtemp(path.join(os.tmpdir(), 'bmt-static-'));
-    const publicDir = path.join(rootDir, 'public');
-    const outsideDir = path.join(rootDir, 'outside');
-    await mkdir(publicDir, { recursive: true });
-    await mkdir(outsideDir, { recursive: true });
-    for (const [name, content] of Object.entries(publicDirFiles)) {
-      await writeFile(path.join(publicDir, name), content);
-    }
-    await writeFile(path.join(outsideDir, 'secret.txt'), 'TOP_SECRET_DO_NOT_LEAK');
-    ctx = await startApp({ publicDir });
-  });
-  after(async () => {
-    if (ctx) await ctx.stop();
-    if (rootDir) await rm(rootDir, { recursive: true, force: true });
+    const withoutOrigin = await fetch(`${url}/api/health`);
+    assert.equal(withoutOrigin.headers.get('access-control-allow-origin'), '*');
   });
 
-  test('GET / → index.html，MIME / no-cache / nosniff / CSP 正确', async () => {
-    const result = await apiRequest(ctx.baseUrl, '/');
-    assert.equal(result.status, 200);
-    assert.equal(result.headers.get('content-type'), 'text/html; charset=utf-8');
-    assert.equal(result.headers.get('cache-control'), 'no-cache');
-    assert.equal(result.headers.get('x-content-type-options'), 'nosniff');
-    assert.equal(
-      result.headers.get('content-security-policy'),
-      "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; " +
-        "script-src 'self'; manifest-src 'self'",
+  test('OPTIONS 预检：204 + Allow-Methods / Allow-Headers / Max-Age', async (t) => {
+    const { url } = await startApp(t);
+    const res = await fetch(`${url}/api/feedings`, {
+      method: 'OPTIONS',
+      headers: {
+        Origin: 'http://x.test',
+        'Access-Control-Request-Method': 'POST',
+        'Access-Control-Request-Headers': 'content-type',
+      },
+    });
+    assert.equal(res.status, 204);
+    assert.equal(res.headers.get('access-control-allow-origin'), '*');
+    assert.equal(res.headers.get('access-control-allow-methods'), 'GET, POST, DELETE, OPTIONS');
+    assert.equal(res.headers.get('access-control-allow-headers'), 'Content-Type');
+    assert.equal(res.headers.get('access-control-max-age'), '86400');
+    assert.equal(await res.text(), '');
+  });
+
+  test('corsOrigins 白名单：匹配来源回显具体 origin + Vary，不匹配不返回', async (t) => {
+    const { url } = await startApp(t, { corsOrigins: ['http://a.test'] });
+
+    const match = await fetch(`${url}/api/health`, { headers: { Origin: 'http://a.test' } });
+    assert.equal(match.headers.get('access-control-allow-origin'), 'http://a.test');
+    assert.match(match.headers.get('vary') ?? '', /Origin/i);
+
+    const mismatch = await fetch(`${url}/api/health`, { headers: { Origin: 'http://b.test' } });
+    assert.equal(mismatch.headers.get('access-control-allow-origin'), null);
+
+    const noOrigin = await fetch(`${url}/api/health`);
+    assert.equal(noOrigin.headers.get('access-control-allow-origin'), null);
+
+    // POST 响应同样带 CORS
+    const created = await postFeeding(
+      url,
+      { feedTypes: ['formula'], amountMl: 120 },
+      { Origin: 'http://a.test' },
     );
-    assert.equal(result.text, publicDirFiles['index.html']);
+    assert.equal(created.status, 201);
+    assert.equal(created.headers.get('access-control-allow-origin'), 'http://a.test');
 
-    const explicit = await apiRequest(ctx.baseUrl, '/index.html');
-    assert.equal(explicit.status, 200);
-    assert.equal(explicit.text, publicDirFiles['index.html']);
+    // 预检匹配来源
+    const preflight = await fetch(`${url}/api/feedings`, {
+      method: 'OPTIONS',
+      headers: {
+        Origin: 'http://a.test',
+        'Access-Control-Request-Method': 'POST',
+        'Access-Control-Request-Headers': 'content-type',
+      },
+    });
+    assert.equal(preflight.status, 204);
+    assert.equal(preflight.headers.get('access-control-allow-origin'), 'http://a.test');
   });
 
-  test('GET /app.js 等静态资源 → 200 且 MIME 正确', async () => {
-    const expectations = [
-      ['/app.js', 'text/javascript; charset=utf-8'],
-      ['/style.css', 'text/css; charset=utf-8'],
-      ['/icon.svg', 'image/svg+xml'],
-      ['/manifest.webmanifest', 'application/manifest+json; charset=utf-8'],
-    ];
-    for (const [pathname, contentType] of expectations) {
-      const result = await apiRequest(ctx.baseUrl, pathname);
-      assert.equal(result.status, 200, `${pathname} 应 200，实际 ${result.status}`);
-      assert.equal(result.headers.get('content-type'), contentType, `${pathname} MIME 错误`);
-      assert.equal(result.headers.get('cache-control'), 'no-cache');
+  test('corsOrigins 多来源：任一匹配来源均可', async (t) => {
+    const { url } = await startApp(t, { corsOrigins: ['http://a.test', 'https://b.test'] });
+    const a = await fetch(`${url}/api/health`, { headers: { Origin: 'http://a.test' } });
+    assert.equal(a.headers.get('access-control-allow-origin'), 'http://a.test');
+    const b = await fetch(`${url}/api/health`, { headers: { Origin: 'https://b.test' } });
+    assert.equal(b.headers.get('access-control-allow-origin'), 'https://b.test');
+    const c = await fetch(`${url}/api/health`, { headers: { Origin: 'http://c.test' } });
+    assert.equal(c.headers.get('access-control-allow-origin'), null);
+  });
+
+  test('静态文件响应不添加 CORS 头', async (t) => {
+    const { url } = await startApp(t);
+    const res = await fetch(`${url}/`, { headers: { Origin: 'http://x.test' } });
+    assert.equal(res.status, 200);
+    assert.equal(res.headers.get('access-control-allow-origin'), null);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 静态文件托管 / SERVE_WEB=0
+// ---------------------------------------------------------------------------
+
+describe('静态文件托管（serveWeb: true）', () => {
+  test('GET / → index.html，MIME + CSP + no-cache + nosniff', async (t) => {
+    const { url } = await startApp(t);
+    const res = await fetch(`${url}/`);
+    assert.equal(res.status, 200);
+    assert.equal(res.headers.get('content-type'), 'text/html; charset=utf-8');
+    assert.equal(res.headers.get('cache-control'), 'no-cache');
+    assert.equal(res.headers.get('x-content-type-options'), 'nosniff');
+    const csp = res.headers.get('content-security-policy') ?? '';
+    for (const directive of [
+      "default-src 'self'",
+      "script-src 'self'",
+      "style-src 'self' 'unsafe-inline'",
+      "img-src 'self' data:",
+      "manifest-src 'self'",
+    ]) {
+      assert.ok(csp.includes(directive), `CSP 应包含 ${directive}`);
     }
-    const js = await apiRequest(ctx.baseUrl, '/app.js');
-    assert.equal(js.text, publicDirFiles['app.js']);
-    assert.equal(js.headers.get('content-security-policy'), null, '非 HTML 不应带 CSP');
+    assert.equal(await res.text(), INDEX_HTML);
   });
 
-  test('不存在文件 / 目录 → 404', async () => {
-    for (const pathname of ['/missing.html', '/nope/app.js', '/sub/']) {
-      const result = await apiRequest(ctx.baseUrl, pathname);
-      assert.equal(result.status, 404, `${pathname} 应 404，实际 ${result.status}`);
+  test('静态资源 MIME：js / css / 子目录 html', async (t) => {
+    const { url } = await startApp(t);
+
+    const js = await fetch(`${url}/app.js`);
+    assert.equal(js.status, 200);
+    assert.equal(js.headers.get('content-type'), 'text/javascript; charset=utf-8');
+    assert.equal(await js.text(), APP_JS);
+
+    const css = await fetch(`${url}/style.css`);
+    assert.equal(css.status, 200);
+    assert.equal(css.headers.get('content-type'), 'text/css; charset=utf-8');
+    assert.equal(await css.text(), STYLE_CSS);
+
+    const sub = await fetch(`${url}/sub/page.html`);
+    assert.equal(sub.status, 200);
+    assert.equal(sub.headers.get('content-type'), 'text/html; charset=utf-8');
+    assert.equal(await sub.text(), SUB_PAGE);
+
+    const indexDirect = await fetch(`${url}/index.html?x=1`);
+    assert.equal(indexDirect.status, 200);
+    assert.equal(await indexDirect.text(), INDEX_HTML);
+  });
+
+  test('HEAD /：200 + Content-Length 且无 body', async (t) => {
+    const { url } = await startApp(t);
+    const res = await fetch(`${url}/`, { method: 'HEAD' });
+    assert.equal(res.status, 200);
+    assert.equal(res.headers.get('content-type'), 'text/html; charset=utf-8');
+    assert.equal(Number(res.headers.get('content-length')), Buffer.byteLength(INDEX_HTML));
+    assert.equal(await res.text(), '');
+  });
+
+  test('未知文件 / 路径穿越 → 404', async (t) => {
+    const { url } = await startApp(t);
+    const missing = await fetch(`${url}/nope.js`);
+    assert.equal(missing.status, 404);
+    assert.equal(await missing.text(), 'Not Found');
+
+    const traversal = await fetch(`${url}/%2e%2e/%2e%2e/etc/passwd`);
+    assert.equal(traversal.status, 404);
+    assert.equal(await traversal.text(), 'Not Found');
+
+    const encodedSlashTraversal = await fetch(`${url}/..%2f..%2fetc%2fpasswd`);
+    assert.equal(encodedSlashTraversal.status, 404);
+  });
+
+  test('静态路径非 GET/HEAD → 405', async (t) => {
+    const { url } = await startApp(t);
+    const post = await fetch(`${url}/`, { method: 'POST', body: 'x' });
+    assert.equal(post.status, 405);
+    assert.equal(await post.text(), 'Method Not Allowed');
+
+    const put = await fetch(`${url}/app.js`, { method: 'PUT', body: 'x' });
+    assert.equal(put.status, 405);
+  });
+});
+
+describe('SERVE_WEB=0（纯 API 模式）', () => {
+  test('/ 与静态资源 404 web_disabled，/api/health 正常', async (t) => {
+    const { url } = await startApp(t, { serveWeb: false });
+
+    for (const pathname of ['/', '/index.html', '/app.js', '/sub/page.html']) {
+      const res = await fetch(`${url}${pathname}`);
+      assert.equal(res.status, 404, `${pathname} 应 404`);
+      assert.match(res.headers.get('content-type') ?? '', /^application\/json/);
+      const body = await res.json();
+      assert.equal(body.error, 'web_disabled');
+      assert.equal(typeof body.message, 'string');
     }
-  });
 
-  test('路径穿越（含 URL 编码绕过）→ 404 且不泄露 public 外内容', async () => {
-    const attempts = [
-      '/../outside/secret.txt',
-      '/..%2foutside%2fsecret.txt',
-      '/%2e%2e%2foutside%2fsecret.txt',
-      '/..%2f..%2f..%2fetc%2fpasswd',
-      '/..%2fpackage.json',
-    ];
-    for (const rawPath of attempts) {
-      const result = await rawGet(ctx.port, rawPath);
-      assert.equal(result.status, 404, `path=${rawPath} 应 404，实际 ${result.status}`);
-      assert.ok(!result.body.includes('TOP_SECRET_DO_NOT_LEAK'), `path=${rawPath} 泄露了 public 外文件内容`);
-      assert.ok(!result.body.includes('root:'), `path=${rawPath} 泄露了 /etc/passwd 内容`);
-    }
-  });
+    const health = await fetch(`${url}/api/health`);
+    assert.equal(health.status, 200);
+    assert.deepEqual(await health.json(), { ok: true });
 
-  test('静态路径非 GET/HEAD 方法 → 405 Method Not Allowed', async () => {
-    for (const method of ['POST', 'PUT', 'DELETE']) {
-      const result = await apiRequest(ctx.baseUrl, '/', { method });
-      assert.equal(result.status, 405, `${method} / 应 405，实际 ${result.status}`);
-      assert.equal(result.headers.get('content-type'), 'text/plain; charset=utf-8');
-      assert.equal(result.text, 'Method Not Allowed');
-    }
-  });
-
-  test('非法百分号编码的静态路径 → 400 Bad Request（不崩溃）', async () => {
-    const result = await rawGet(ctx.port, '/%zz');
-    assert.equal(result.status, 400);
-    assert.equal(result.body, 'Bad Request');
-  });
-
-  test('HEAD / → 200，有 Content-Length 无响应体', async () => {
-    const result = await apiRequest(ctx.baseUrl, '/', { method: 'HEAD' });
-    assert.equal(result.status, 200);
-    assert.equal(result.headers.get('content-type'), 'text/html; charset=utf-8');
-    assert.equal(result.text, '');
-    assert.equal(Number(result.headers.get('content-length')), Buffer.byteLength(publicDirFiles['index.html']));
+    // API 仍可写
+    const created = await postFeeding(url, { feedTypes: ['formula'], amountMl: 120 });
+    assert.equal(created.status, 201);
   });
 });

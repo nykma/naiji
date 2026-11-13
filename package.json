@@ -1,23 +1,30 @@
 {
-  "name": "baby-milk-tracker",
-  "version": "1.0.0",
+  "name": "naiji",
+  "version": "2.0.0",
   "private": true,
-  "description": "奶记 · 婴儿喂奶 / 大小便记录（Node.js 内置 HTTP + SQLite，零第三方依赖）",
+  "description": "奶记 · 婴儿喂养记录：server（HTTP API + SQLite）/ web（纯静态前端）/ cli（命令行）",
   "type": "module",
   "engines": {
     "node": ">=22.13.0"
   },
+  "bin": {
+    "naiji": "cli/bin/naiji"
+  },
   "scripts": {
-    "start": "node src/server.js",
-    "dev": "node --watch src/server.js",
+    "start": "node server/src/server.js",
+    "server": "node server/src/server.js",
+    "web": "node scripts/serve-web.mjs",
+    "cli": "node cli/bin/naiji.mjs",
     "test": "node --test",
-    "test:watch": "node --test --watch"
+    "test:watch": "node --test --watch",
+    "e2e": "node scripts/browser-e2e.mjs"
   },
   "keywords": [
     "baby",
     "feeding",
     "tracker",
-    "sqlite"
+    "sqlite",
+    "cli"
   ],
   "license": "UNLICENSED"
 }

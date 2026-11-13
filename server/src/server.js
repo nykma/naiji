@@ -1,9 +1,10 @@
 /**
- * 奶记 · HTTP 服务
+ * 奶记 · HTTP API 服务（v2，前后端分离）
  *
- * - 零第三方依赖：node:http + node:sqlite，静态托管 public/
- * - REST API 与行为契约见 docs/CONTRACT.md
- * - 可直接 `node src/server.js` 启动，也可在测试里 `createApp()` 后自行 listen
+ * - 零第三方依赖：node:http + node:sqlite
+ * - 纯 JSON API；可选托管 web/ 静态文件（SERVE_WEB=1，方便家庭单机部署）
+ * - 支持 CORS，web 可独立部署到任意静态主机
+ * - 契约见 docs/CONTRACT.md
  */
 
 import http from 'node:http';
@@ -15,11 +16,18 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import { openDb } from './db.js';
 import { buildState } from './state.js';
+import {
+  FEED_TYPE_LABELS,
+  DIAPER_KIND_LABELS,
+  isValidFeedType,
+  requiresAmount,
+  sortFeedTypes,
+} from './feed-types.js';
 import { isValidTzOffset } from './util/time.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
-const ROOT_DIR = path.resolve(HERE, '..');
-export const DEFAULT_PUBLIC_DIR = path.join(ROOT_DIR, 'public');
+export const ROOT_DIR = path.resolve(HERE, '..', '..');
+export const DEFAULT_WEB_DIR = path.join(ROOT_DIR, 'web');
 export const DEFAULT_DB_PATH = path.join(ROOT_DIR, 'data', 'baby.db');
 
 const MAX_BODY_BYTES = 64 * 1024;
@@ -32,11 +40,7 @@ const DEFAULT_EVENT_LIMIT = 50;
 const MAX_EVENT_LIMIT = 200;
 const RECENT_LIMIT = 30;
 
-const FEED_TYPES = new Set(['formula', 'breast_milk', 'breast_direct']);
 const DIAPER_KINDS = new Set(['pee', 'poop', 'mixed']);
-
-const FEED_TYPE_TEXT = { formula: '奶粉', breast_milk: '母乳（瓶喂）', breast_direct: '亲喂' };
-const DIAPER_KIND_TEXT = { pee: '小便', poop: '大便', mixed: '大小便' };
 
 const MIME_TYPES = {
   '.html': 'text/html; charset=utf-8',
@@ -57,8 +61,12 @@ const MIME_TYPES = {
   '.map': 'application/json; charset=utf-8',
 };
 
+const CSP =
+  "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; " +
+  "script-src 'self'; manifest-src 'self'; connect-src *";
+
 // ---------------------------------------------------------------------------
-// 响应助手
+// 响应与 CORS
 // ---------------------------------------------------------------------------
 
 function sendJson(res, status, payload, extraHeaders = {}) {
@@ -86,14 +94,31 @@ function sendText(res, status, text) {
   res.end(text);
 }
 
+/** @param {string[]} allowedOrigins `['*']` 或具体来源列表 */
+function applyCors(req, res, allowedOrigins) {
+  const origin = req.headers.origin;
+  let allow = null;
+  if (allowedOrigins.includes('*')) allow = '*';
+  else if (origin && allowedOrigins.includes(origin)) allow = origin;
+  if (!allow) return;
+  res.setHeader('Access-Control-Allow-Origin', allow);
+  if (allow !== '*') res.setHeader('Vary', 'Origin');
+}
+
+function handleCorsPreflight(res) {
+  res.writeHead(204, {
+    'Access-Control-Allow-Methods': 'GET, POST, DELETE, OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type',
+    'Access-Control-Max-Age': '86400',
+    'Content-Length': '0',
+  });
+  res.end();
+}
+
 // ---------------------------------------------------------------------------
 // 请求体解析与校验
 // ---------------------------------------------------------------------------
 
-/**
- * 读取并解析 JSON 请求体。
- * @returns {Promise<{ ok: true, value: Record<string, unknown> } | { ok: false, status: number, code: string, message: string }>}
- */
 function readJsonBody(req) {
   return new Promise((resolve) => {
     const contentType = String(req.headers['content-type'] ?? '')
@@ -158,51 +183,71 @@ function readJsonBody(req) {
   });
 }
 
-function validateAmount(rawAmount, feedType) {
-  if (feedType === 'breast_direct') {
-    if (rawAmount === undefined || rawAmount === null) return { ok: true, value: null };
-    return {
-      ok: false,
-      status: 400,
-      code: 'unexpected_amount',
-      message: '亲喂不需要填写奶量',
-    };
+function fail(status, code, message) {
+  return { ok: false, status, code, message };
+}
+
+/** feedTypes 校验 + 规范化（v1 旧客户端的单值 feedType 已在 handler 里包装成数组） */
+function validateFeedTypes(raw) {
+  if (raw === undefined || raw === null) {
+    return fail(400, 'invalid_feed_types', '请至少选择一种喂奶类型（formula / breast_milk / breast_direct）');
   }
-  if (rawAmount === undefined || rawAmount === null) {
-    return { ok: false, status: 400, code: 'invalid_amount', message: '请填写奶量（毫升）' };
+  if (!Array.isArray(raw)) {
+    return fail(400, 'invalid_feed_types', 'feedTypes 必须是数组');
   }
-  if (!Number.isInteger(rawAmount) || rawAmount < AMOUNT_MIN_ML || rawAmount > AMOUNT_MAX_ML) {
-    return {
-      ok: false,
-      status: 400,
-      code: 'invalid_amount',
-      message: `奶量必须是 ${AMOUNT_MIN_ML} 到 ${AMOUNT_MAX_ML} 之间的整数（毫升）`,
-    };
+  const list = raw;
+  if (list.length === 0) {
+    return fail(400, 'invalid_feed_types', '请至少选择一种喂奶类型');
   }
-  return { ok: true, value: rawAmount };
+  if (list.length > 3) {
+    return fail(400, 'invalid_feed_types', '喂奶类型最多 3 种');
+  }
+  if (list.some((type) => !isValidFeedType(type))) {
+    return fail(400, 'invalid_feed_types', '喂奶类型无效（formula / breast_milk / breast_direct）');
+  }
+  const types = sortFeedTypes(list);
+  if (types.length !== list.length) {
+    return fail(400, 'invalid_feed_types', '喂奶类型不能重复');
+  }
+  return { ok: true, value: types };
+}
+
+function validateFeedAmount(raw, types) {
+  if (!requiresAmount(types)) {
+    if (raw === undefined || raw === null) return { ok: true, value: null };
+    return fail(400, 'unexpected_amount', '仅亲喂时不需要填写奶量');
+  }
+  if (raw === undefined || raw === null) {
+    return fail(400, 'invalid_amount', '请填写奶量（毫升）');
+  }
+  if (!Number.isInteger(raw) || raw < AMOUNT_MIN_ML || raw > AMOUNT_MAX_ML) {
+    return fail(
+      400,
+      'invalid_amount',
+      `奶量必须是 ${AMOUNT_MIN_ML} 到 ${AMOUNT_MAX_ML} 之间的整数（毫升）`,
+    );
+  }
+  return { ok: true, value: raw };
 }
 
 function validateHappenedAt(raw, nowMs) {
   if (raw === undefined || raw === null) return { ok: true, value: nowMs };
   if (!Number.isInteger(raw) || raw < HAPPENED_AT_MIN_MS || raw > nowMs + HAPPENED_AT_FUTURE_TOLERANCE_MS) {
-    return {
-      ok: false,
-      status: 400,
-      code: 'invalid_happened_at',
-      message: '记录时间不合法（必须是毫秒时间戳，且不能晚于当前时间 5 分钟）',
-    };
+    return fail(
+      400,
+      'invalid_happened_at',
+      '记录时间不合法（必须是毫秒时间戳，且不能晚于当前时间 5 分钟）',
+    );
   }
   return { ok: true, value: raw };
 }
 
 function validateNote(raw) {
   if (raw === undefined || raw === null) return { ok: true, value: null };
-  if (typeof raw !== 'string') {
-    return { ok: false, status: 400, code: 'invalid_note', message: '备注必须是字符串' };
-  }
+  if (typeof raw !== 'string') return fail(400, 'invalid_note', '备注必须是字符串');
   const trimmed = raw.trim();
   if (trimmed.length > NOTE_MAX_LENGTH) {
-    return { ok: false, status: 400, code: 'invalid_note', message: `备注不能超过 ${NOTE_MAX_LENGTH} 个字符` };
+    return fail(400, 'invalid_note', `备注不能超过 ${NOTE_MAX_LENGTH} 个字符`);
   }
   return { ok: true, value: trimmed === '' ? null : trimmed };
 }
@@ -260,22 +305,26 @@ async function handleCreateFeeding(req, res, store, nowMs) {
   const body = await readJsonBody(req);
   if (!body.ok) return sendError(res, body.status, body.code, body.message);
 
-  const { feedType } = body.value;
-  if (!FEED_TYPES.has(feedType)) {
-    return sendError(res, 400, 'invalid_feed_type', '喂奶类型无效（formula / breast_milk / breast_direct）');
-  }
-  const amount = validateAmount(body.value.amountMl, feedType);
+  // 兼容 v1 客户端：{ feedType: "formula" } → [ "formula" ]
+  const rawTypes =
+    body.value.feedTypes !== undefined
+      ? body.value.feedTypes
+      : body.value.feedType !== undefined
+        ? [body.value.feedType]
+        : undefined;
+
+  const types = validateFeedTypes(rawTypes);
+  if (!types.ok) return sendError(res, types.status, types.code, types.message);
+  const amount = validateFeedAmount(body.value.amountMl, types.value);
   if (!amount.ok) return sendError(res, amount.status, amount.code, amount.message);
   const happenedAt = validateHappenedAt(body.value.happenedAt, nowMs);
   if (!happenedAt.ok) return sendError(res, happenedAt.status, happenedAt.code, happenedAt.message);
   const note = validateNote(body.value.note);
   if (!note.ok) return sendError(res, note.status, note.code, note.message);
 
-  const event = store.createEvent({
-    kind: 'feed',
-    feedType,
+  const event = store.createFeedEvent({
+    feedTypes: types.value,
     amountMl: amount.value,
-    diaperKind: null,
     note: note.value,
     happenedAt: happenedAt.value,
     createdAt: nowMs,
@@ -296,10 +345,7 @@ async function handleCreateDiaper(req, res, store, nowMs) {
   const note = validateNote(body.value.note);
   if (!note.ok) return sendError(res, note.status, note.code, note.message);
 
-  const event = store.createEvent({
-    kind: 'diaper',
-    feedType: null,
-    amountMl: null,
+  const event = store.createDiaperEvent({
     diaperKind,
     note: note.value,
     happenedAt: happenedAt.value,
@@ -309,9 +355,7 @@ async function handleCreateDiaper(req, res, store, nowMs) {
 }
 
 function handleDeleteEvent(res, id, store) {
-  if (!store.deleteEvent(id)) {
-    return sendError(res, 404, 'not_found', '记录不存在');
-  }
+  if (!store.deleteEvent(id)) return sendError(res, 404, 'not_found', '记录不存在');
   res.writeHead(204, { 'Cache-Control': 'no-store' });
   res.end();
 }
@@ -342,11 +386,14 @@ function handleExportCsv(res, store, nowMs) {
   const lines = ['时间,类别,项目,奶量(ml),备注'];
   for (const event of store.allEvents()) {
     const isFeed = event.kind === 'feed';
+    const project = isFeed
+      ? (event.feedTypes ?? []).map((type) => FEED_TYPE_LABELS[type] ?? type).join(' + ')
+      : (DIAPER_KIND_LABELS[event.diaperKind] ?? '');
     lines.push(
       [
         formatLocalDateTime(event.happenedAt),
         isFeed ? '喂奶' : '大小便',
-        isFeed ? (FEED_TYPE_TEXT[event.feedType] ?? '') : (DIAPER_KIND_TEXT[event.diaperKind] ?? ''),
+        project,
         isFeed && event.amountMl !== null ? event.amountMl : '',
         event.note,
       ]
@@ -367,14 +414,10 @@ function handleExportCsv(res, store, nowMs) {
 }
 
 // ---------------------------------------------------------------------------
-// 静态文件
+// 静态文件（可选：托管 web/）
 // ---------------------------------------------------------------------------
 
-const CSP =
-  "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; " +
-  "script-src 'self'; manifest-src 'self'";
-
-async function serveStatic(req, res, pathname, publicDir) {
+async function serveStatic(req, res, pathname, webDir) {
   if (req.method !== 'GET' && req.method !== 'HEAD') {
     return sendText(res, 405, 'Method Not Allowed');
   }
@@ -387,7 +430,7 @@ async function serveStatic(req, res, pathname, publicDir) {
   }
   if (decodedPath === '/' || decodedPath === '') decodedPath = '/index.html';
 
-  const root = path.resolve(publicDir);
+  const root = path.resolve(webDir);
   const target = path.resolve(root, `.${decodedPath.startsWith('/') ? decodedPath : `/${decodedPath}`}`);
   if (target !== root && !target.startsWith(root + path.sep)) {
     return sendText(res, 404, 'Not Found');
@@ -424,11 +467,23 @@ async function serveStatic(req, res, pathname, publicDir) {
 
 /**
  * 创建应用（不自动 listen，便于测试）。
- * @param {{ dbPath?: string, publicDir?: string, now?: () => number }} [options]
- * @returns {{ server: http.Server, store: import('./db.js').Store, dbPath: string, close: () => Promise<void> }}
+ * @param {{
+ *   dbPath?: string,
+ *   webDir?: string,
+ *   serveWeb?: boolean,
+ *   corsOrigins?: string[],
+ *   now?: () => number,
+ * }} [options]
  */
-export function createApp({ dbPath = DEFAULT_DB_PATH, publicDir = DEFAULT_PUBLIC_DIR, now = () => Date.now() } = {}) {
+export function createApp({
+  dbPath = DEFAULT_DB_PATH,
+  webDir = DEFAULT_WEB_DIR,
+  serveWeb = true,
+  corsOrigins = ['*'],
+  now = () => Date.now(),
+} = {}) {
   const store = openDb(dbPath);
+  const allowedOrigins = Array.isArray(corsOrigins) && corsOrigins.length > 0 ? corsOrigins : ['*'];
 
   const server = http.createServer(async (req, res) => {
     const startedAt = Date.now();
@@ -441,6 +496,12 @@ export function createApp({ dbPath = DEFAULT_DB_PATH, publicDir = DEFAULT_PUBLIC
       const url = new URL(req.url ?? '/', 'http://localhost');
       const { pathname } = url;
       const nowMs = now();
+      const isApi = pathname.startsWith('/api/');
+
+      if (isApi) {
+        applyCors(req, res, allowedOrigins);
+        if (req.method === 'OPTIONS') return handleCorsPreflight(res);
+      }
 
       if (pathname === '/api/health' && req.method === 'GET') return handleHealth(req, res);
       if (pathname === '/api/state' && req.method === 'GET') return handleState(req, res, url, store, nowMs);
@@ -459,11 +520,17 @@ export function createApp({ dbPath = DEFAULT_DB_PATH, publicDir = DEFAULT_PUBLIC
         return handleDeleteEvent(res, Number(deleteMatch[1]), store);
       }
 
-      if (pathname.startsWith('/api/')) {
-        return sendError(res, 404, 'not_found', '接口不存在');
-      }
+      if (isApi) return sendError(res, 404, 'not_found', '接口不存在');
 
-      return await serveStatic(req, res, pathname, publicDir);
+      if (!serveWeb) {
+        return sendError(
+          res,
+          404,
+          'web_disabled',
+          '静态托管已关闭（SERVE_WEB=0）：web 前端请独立部署（可用 scripts/serve-web.mjs），或访问 API 端口',
+        );
+      }
+      return await serveStatic(req, res, pathname, webDir);
     } catch (error) {
       console.error('[server] 未捕获错误:', error);
       if (res.headersSent) {
@@ -485,7 +552,7 @@ export function createApp({ dbPath = DEFAULT_DB_PATH, publicDir = DEFAULT_PUBLIC
     store.close();
   };
 
-  return { server, store, dbPath, close };
+  return { server, store, dbPath, webDir, close };
 }
 
 // ---------------------------------------------------------------------------
@@ -504,17 +571,28 @@ function localUrls(port) {
   return urls;
 }
 
+function parseOrigins(raw) {
+  if (!raw || !raw.trim()) return ['*'];
+  return raw
+    .split(',')
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
 async function main() {
   const port = Number(process.env.PORT ?? 3000);
   const host = process.env.HOST ?? '0.0.0.0';
   const dbPath = process.env.DB_PATH ? path.resolve(process.env.DB_PATH) : DEFAULT_DB_PATH;
+  const serveWeb = process.env.SERVE_WEB !== '0' && process.env.SERVE_WEB !== 'false';
+  const webDir = process.env.WEB_DIR ? path.resolve(process.env.WEB_DIR) : DEFAULT_WEB_DIR;
+  const corsOrigins = parseOrigins(process.env.CORS_ORIGINS);
 
   if (!Number.isInteger(port) || port < 0 || port > 65535) {
     console.error(`PORT 不合法: ${process.env.PORT}`);
     process.exit(1);
   }
 
-  const app = createApp({ dbPath });
+  const app = createApp({ dbPath, webDir, serveWeb, corsOrigins });
   try {
     await new Promise((resolve, reject) => {
       app.server.once('error', reject);
@@ -531,10 +609,16 @@ async function main() {
 
   const actualPort = app.server.address().port;
   console.log('');
-  console.log('  🍼 奶记 · 婴儿喂养记录已启动');
+  console.log('  🍼 奶记 API 已启动');
   console.log(`     数据库: ${dbPath}`);
-  console.log('     打开页面:');
-  for (const url of localUrls(actualPort)) console.log(`       ${url}`);
+  console.log(`     API:    http://localhost:${actualPort}/api/health`);
+  if (serveWeb) {
+    console.log('     网页:');
+    for (const url of localUrls(actualPort)) console.log(`       ${url}`);
+  } else {
+    console.log('     网页:   SERVE_WEB=0（未托管静态文件，请独立部署 web/）');
+  }
+  console.log(`     CLI:    naiji status --server http://127.0.0.1:${actualPort}`);
   console.log('     Ctrl+C 停止');
   console.log('');
 

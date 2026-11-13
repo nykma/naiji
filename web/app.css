@@ -32,8 +32,6 @@
   --chip-bg: #fff4eb;
   --chip-border: #f3ddcc;
   --chip-text: #5e4335;
-  --seg-bg: #f7eadf;
-  --seg-active: #ffffff;
   --input-bg: #fffdfb;
   --hero-1: #ff936f;
   --hero-2: #f25c46;
@@ -71,8 +69,6 @@
     --chip-bg: #2b211c;
     --chip-border: #3e2d26;
     --chip-text: #f5e5db;
-    --seg-bg: #2b211d;
-    --seg-active: #3b2b24;
     --input-bg: #1d1512;
     --hero-1: #e66f50;
     --hero-2: #d24f37;
@@ -423,6 +419,11 @@ a {
   color: #fffdf9;
 }
 
+/* 奶量（如「120 ml」）不拆行；标签部分仍可正常换行 */
+.hero-last-amount {
+  white-space: nowrap;
+}
+
 .hero-divider {
   position: relative;
   height: 1px;
@@ -449,50 +450,109 @@ a {
    喂奶区
    -------------------------------------------------------------------------- */
 
+/* 喂奶类型：多选 toggle（可同时选中多个，至少一个） */
+
 .segmented {
   display: grid;
-  grid-template-columns: repeat(3, 1fr);
-  gap: 4px;
-  padding: 4px;
-  border-radius: 16px;
-  background: var(--seg-bg);
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
 }
 
 .seg-btn {
-  height: var(--tap);
-  border: 0;
-  border-radius: 12px;
-  background: transparent;
-  color: var(--muted);
-  font-size: clamp(13px, 3.6vw, 14px);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  min-width: 0;
+  height: 54px;
+  padding: 0 6px;
+  border: 1.5px solid var(--chip-border);
+  border-radius: 15px;
+  background: var(--chip-bg);
+  color: var(--chip-text);
+  font-size: clamp(12.5px, 3.4vw, 14px);
   font-weight: 650;
   white-space: nowrap;
   cursor: pointer;
   transition:
     background 0.18s ease,
+    border-color 0.18s ease,
     color 0.18s ease,
     box-shadow 0.18s ease,
     transform 0.12s ease;
 }
 
-.seg-btn[aria-pressed="true"] {
-  background: var(--seg-active);
-  color: var(--primary-strong);
-  box-shadow: 0 2px 8px -2px rgba(150, 70, 40, 0.22);
+/* 勾选圆点：未选中是空心圈，选中变成实心珊瑚底 + 白色勾 */
+.seg-check {
+  display: grid;
+  place-items: center;
+  width: 14px;
+  height: 14px;
+  flex: none;
+  border-radius: 50%;
+  border: 1.5px solid var(--muted-2);
+  background: transparent;
+  color: transparent;
+  transition:
+    background 0.18s ease,
+    border-color 0.18s ease,
+    color 0.18s ease,
+    transform 0.18s cubic-bezier(0.2, 0.9, 0.3, 1.5);
 }
 
-/* 深色模式里「选中 pill」和容器底色太接近，补一圈内描边增强选中态 */
-@media (prefers-color-scheme: dark) {
-  .seg-btn[aria-pressed="true"] {
-    background: #43302a;
-    box-shadow:
-      0 2px 10px -4px rgba(0, 0, 0, 0.6),
-      inset 0 0 0 1px rgba(255, 129, 100, 0.22);
-  }
+.seg-check::before {
+  content: "✓";
+  font-size: 9px;
+  font-weight: 900;
+  line-height: 1;
+}
+
+.seg-btn:hover {
+  border-color: var(--accent);
+  background: var(--primary-soft-2);
+  color: var(--primary-strong);
+}
+
+.seg-btn[aria-pressed="true"] {
+  border-color: var(--primary);
+  background: linear-gradient(155deg, #ffeae0, #ffd8c6);
+  color: var(--primary-strong);
+  box-shadow:
+    0 8px 18px -12px rgba(226, 88, 60, 0.75),
+    inset 0 0 0 1px rgba(255, 255, 255, 0.55);
+}
+
+.seg-btn[aria-pressed="true"] .seg-check {
+  border-color: var(--primary);
+  background: var(--primary);
+  color: #fff;
+  transform: scale(1.05);
 }
 
 .seg-btn:active {
   transform: scale(0.97);
+}
+
+/* 点了唯一选中项（不允许取消）时轻轻抖一下作为提示 */
+.seg-btn.is-nudge {
+  animation: nudge 0.36s ease;
+}
+
+@media (prefers-color-scheme: dark) {
+  .seg-btn[aria-pressed="true"] {
+    border-color: var(--primary);
+    background: linear-gradient(155deg, #4a2c20, #38221a);
+    color: var(--primary-strong);
+    box-shadow:
+      0 8px 18px -12px rgba(0, 0, 0, 0.8),
+      inset 0 0 0 1px rgba(255, 129, 100, 0.18);
+  }
+
+  .seg-btn[aria-pressed="true"] .seg-check {
+    border-color: var(--primary);
+    background: var(--primary);
+    color: #2b1712;
+  }
 }
 
 .amount-panel,
@@ -505,12 +565,44 @@ a {
   font-size: 12.5px;
   font-weight: 650;
   letter-spacing: 0.04em;
+  line-height: 1.5;
   color: var(--muted);
+  overflow-wrap: anywhere;
 }
 
 .field-hint {
   color: var(--muted-2);
   font-weight: 500;
+}
+
+/* 亲喂 + 瓶喂组合时的小提示：奶量只填本次补充的瓶喂量 */
+.bottle-tip {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0 0 10px;
+  padding: 7px 11px;
+  border-radius: 11px;
+  border: 1px solid color-mix(in srgb, var(--primary) 24%, transparent);
+  background: var(--primary-soft-2);
+  color: var(--primary-strong);
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1.45;
+}
+
+.bottle-tip-icon {
+  flex: none;
+  font-size: 13px;
+  line-height: 1;
+}
+
+@media (prefers-color-scheme: dark) {
+  .bottle-tip {
+    border-color: rgba(255, 129, 100, 0.3);
+    background: rgba(255, 129, 100, 0.1);
+    color: #ffb49f;
+  }
 }
 
 .chips {
@@ -929,6 +1021,16 @@ a {
   overflow-wrap: anywhere;
 }
 
+/* 标签文案与奶量分开成段：奶量整体不换行，空间不够时整段落到第二行，
+   避免出现 "120 ml" 被拆成 "120" / "ml" 的孤行 */
+.event-title-label {
+  word-break: keep-all;
+}
+
+.event-title-amount {
+  white-space: nowrap;
+}
+
 .event-time {
   flex: none;
   font-size: 12.5px;
@@ -1285,6 +1387,25 @@ body.is-busy .record-btn {
   }
 }
 
+@keyframes nudge {
+  0%,
+  100% {
+    transform: translateX(0);
+  }
+  20% {
+    transform: translateX(-3px);
+  }
+  40% {
+    transform: translateX(3px);
+  }
+  60% {
+    transform: translateX(-2px);
+  }
+  80% {
+    transform: translateX(2px);
+  }
+}
+
 @keyframes toast-in {
   from {
     opacity: 0;
@@ -1340,6 +1461,25 @@ body.is-busy .record-btn {
 
   .chip-num {
     font-size: 18px;
+  }
+
+  .segmented {
+    gap: 6px;
+  }
+
+  .seg-btn {
+    gap: 4px;
+    padding: 0 4px;
+    font-size: 12px;
+  }
+
+  .seg-check {
+    width: 12px;
+    height: 12px;
+  }
+
+  .seg-check::before {
+    font-size: 8px;
   }
 
   .custom-row {

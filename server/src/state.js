@@ -1,5 +1,5 @@
 /**
- * 奶记 · 首页聚合状态（/api/state 的响应体构造）
+ * 奶记 · 首页聚合状态（/api/state 的响应体构造，v2）
  * 纯函数式：给定 store + 当前时间 + 时区偏移即可确定输出，便于单测。
  */
 
@@ -15,10 +15,11 @@ export function buildState(store, nowMs, tzOffsetMinutes = null) {
   const today = {
     date: dateKey,
     feedCount: 0,
-    breastDirectCount: 0,
-    formulaMl: 0,
-    breastMl: 0,
     totalMl: 0,
+    formulaCount: 0,
+    breastMilkCount: 0,
+    breastDirectCount: 0,
+    mixedFeedCount: 0,
     diaperCount: 0,
     peeCount: 0,
     poopCount: 0,
@@ -28,13 +29,12 @@ export function buildState(store, nowMs, tzOffsetMinutes = null) {
   for (const event of store.eventsBetween(start, end)) {
     if (event.kind === 'feed') {
       today.feedCount += 1;
-      if (event.feedType === 'formula') {
-        today.formulaMl += event.amountMl ?? 0;
-      } else if (event.feedType === 'breast_milk') {
-        today.breastMl += event.amountMl ?? 0;
-      } else if (event.feedType === 'breast_direct') {
-        today.breastDirectCount += 1;
-      }
+      if (event.amountMl !== null) today.totalMl += event.amountMl;
+      const types = event.feedTypes ?? [];
+      if (types.includes('formula')) today.formulaCount += 1;
+      if (types.includes('breast_milk')) today.breastMilkCount += 1;
+      if (types.includes('breast_direct')) today.breastDirectCount += 1;
+      if (types.length > 1) today.mixedFeedCount += 1;
     } else if (event.kind === 'diaper') {
       today.diaperCount += 1;
       if (event.diaperKind === 'mixed') {
@@ -48,7 +48,6 @@ export function buildState(store, nowMs, tzOffsetMinutes = null) {
       }
     }
   }
-  today.totalMl = today.formulaMl + today.breastMl;
 
   return {
     now: nowMs,

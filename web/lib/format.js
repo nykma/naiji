@@ -1,14 +1,20 @@
 /**
- * 奶记 · 共享格式化工具（纯函数）
+ * 奶记 · 共享格式化工具（纯函数，v2）
  *
- * 浏览器（public/index.html）与 Node 测试（test/format.test.js）共用。
+ * 浏览器（web/index.html 经 app.js import）与 Node 测试（test/*.test.js）共用。
  * 约定：所有时间戳为 epoch 毫秒；日期/时钟展示一律使用**运行环境的本地时区**。
  * 本文件不要依赖 DOM、fetch、process 等环境 API。
+ *
+ * v2 变更：喂奶类型由单值改为多标签数组（feedTypes），并新增 feedTypesLabel()。
+ * 规范顺序：formula → breast_milk → breast_direct。
  */
 
 const MINUTE = 60_000;
 const HOUR = 60 * MINUTE;
 const DAY = 24 * HOUR;
+
+/** 喂奶类型（规范顺序） */
+export const FEED_TYPES = ['formula', 'breast_milk', 'breast_direct'];
 
 const FEED_TYPE_LABELS = {
   formula: '奶粉',
@@ -90,30 +96,63 @@ export function feedTypeLabel(feedType) {
   return FEED_TYPE_LABELS[feedType] ?? '喂奶';
 }
 
+/** 按规范顺序排列、去重并丢弃非法值；非数组 → [] */
+export function sortFeedTypes(types) {
+  const set = new Set(Array.isArray(types) ? types.filter((type) => FEED_TYPES.includes(type)) : []);
+  return FEED_TYPES.filter((type) => set.has(type));
+}
+
+/**
+ * 多标签喂奶类型 → 中文文案，按规范顺序用 " + " 连接。
+ * 例：['breast_milk','formula'] → "奶粉 + 母乳（瓶喂）"；空数组 → ''。
+ */
+export function feedTypesLabel(types) {
+  return sortFeedTypes(types)
+    .map((type) => feedTypeLabel(type))
+    .join(' + ');
+}
+
 /** 大小便类型 → 中文 */
 export function diaperKindLabel(diaperKind) {
   return DIAPER_KIND_LABELS[diaperKind] ?? '大小便';
 }
 
-/** 事件标题：喂奶 → "奶粉 120 ml" / "亲喂"；大小便 → "小便" */
+/**
+ * 从事件中取规范化的 feedTypes（兼容 v1 单值字段 feedType，便于共享纯函数鲁棒）。
+ */
+function eventFeedTypes(event) {
+  if (Array.isArray(event.feedTypes)) return event.feedTypes;
+  if (typeof event.feedType === 'string') return [event.feedType];
+  return [];
+}
+
+/**
+ * 事件标题：
+ * - 喂奶有奶量 → "奶粉 + 母乳（瓶喂） 120 ml"
+ * - 喂奶无奶量 → 标签文案（"亲喂"）
+ * - 大小便 → 小便 / 大便 / 大小便
+ */
 export function eventTitle(event) {
   if (!event) return '';
   if (event.kind === 'feed') {
-    if (event.feedType === 'breast_direct') return '亲喂';
-    const label = feedTypeLabel(event.feedType);
+    const label = feedTypesLabel(eventFeedTypes(event));
     const amount = formatAmount(event.amountMl);
-    return amount ? `${label} ${amount}` : label;
+    if (amount) return label ? `${label} ${amount}` : amount;
+    return label || '喂奶';
   }
   return diaperKindLabel(event.diaperKind);
 }
 
-/** 事件图标 emoji */
+/**
+ * 事件图标 emoji：含 formula → 🍼；否则含 breast_milk → 🥛；否则 🤱；大小便同 v1。
+ */
 export function eventIcon(event) {
   if (!event) return '';
   if (event.kind === 'feed') {
-    if (event.feedType === 'breast_direct') return '🤱';
-    if (event.feedType === 'breast_milk') return '🥛';
-    return '🍼';
+    const types = eventFeedTypes(event);
+    if (types.includes('formula')) return '🍼';
+    if (types.includes('breast_milk')) return '🥛';
+    return '🤱';
   }
   if (event.diaperKind === 'pee') return '💧';
   if (event.diaperKind === 'poop') return '💩';

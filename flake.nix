@@ -1,5 +1,5 @@
 {
-  description = "奶记 · 婴儿喂养记录 (Node.js + SQLite)";
+  description = "奶记 · 婴儿喂养记录 (Node.js + SQLite: server / web / cli)";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
 
@@ -22,7 +22,9 @@
               pkgs.curl
             ];
             shellHook = ''
-              echo "奶记 dev shell: $(node --version) (npm start 启动, npm test 测试)"
+              # 让 naiji 命令指向工作区里的 CLI（跟随源码改动，不冻结到 nix store）
+              export PATH="$PWD/cli/bin:$PATH"
+              echo "奶记 dev shell: $(node --version) · server: npm start · cli: naiji · 测试: npm test"
             '';
           };
         }

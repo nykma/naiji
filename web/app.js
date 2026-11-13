@@ -1,8 +1,12 @@
 /**
- * 奶记 · 前端交互（ES Module，无第三方依赖）
+ * 奶记 · 前端交互（ES Module，无第三方依赖，v2）
  *
  * 设计要点：
  * - 所有事件用 addEventListener 绑定（CSP 禁止内联脚本）。
+ * - 所有 HTTP 请求 / 导出链接都经由 lib/api.js 的 apiUrl()，支持前后端分离部署。
+ * - 喂奶类型为**多选标签**（至少一个，规范顺序 formula → breast_milk → breast_direct）：
+ *   选中的标签持久化到 localStorage['naiji.feedTypes']；含奶粉/母乳时显示奶量面板，
+ *   点一下奶量即 POST { feedTypes, amountMl } 记录一条；仅亲喂时显示「亲喂一次」按钮。
  * - Hero「距离上次喂奶」用本地 Date.now() 与 lastFeeding.happenedAt 计算，每秒刷新。
  * - 记录成功后先用 POST 返回的 event 就地更新（Hero 立即变「刚刚」），
  *   删除后用 /api/state 校准 lastFeeding / today，避免本地推算误差。
@@ -10,17 +14,21 @@
  */
 
 import {
+  FEED_TYPES,
   formatDuration,
+  formatAmount,
   formatClock,
   formatDayKey,
   formatDayLabel,
-  feedTypeLabel,
+  feedTypesLabel,
+  sortFeedTypes,
   eventTitle,
   eventIcon,
 } from '/lib/format.js';
+import { apiUrl, request, stateUrl, ApiError } from '/lib/api.js';
 
-const FEED_TYPES = ['formula', 'breast_milk', 'breast_direct'];
-const FEED_TYPE_STORAGE_KEY = 'naiji.feedType';
+const FEED_TYPES_STORAGE_KEY = 'naiji.feedTypes';
+const LEGACY_FEED_TYPE_STORAGE_KEY = 'naiji.feedType';
 const RECENT_LIMIT = 30;
 const PAGE_SIZE = 50;
 const MIN_AMOUNT_ML = 1;
@@ -29,6 +37,7 @@ const CLOCK_TICK_MS = 1000;
 const TOAST_UNDO_MS = 5000;
 const TOAST_ERROR_MS = 4200;
 const TOAST_PLAIN_MS = 3000;
+const TOAST_SHORT_MS = 1800;
 
 /* --------------------------------------------------------------------------
    状态
@@ -43,7 +52,7 @@ const state = {
   today: null,
   events: [], // 已加载的事件，happenedAt DESC, id DESC
   hasMore: false,
-  feedType: readStoredFeedType(),
+  feedTypes: readStoredFeedTypes(), // 规范顺序、至少一个
   loadingMore: false,
   deletingIds: new Set(),
   rolloverChecking: false,
@@ -69,9 +78,10 @@ const els = {
   gapLastFeed: byTestId('gap-last-feed'),
   gapLastDiaper: byTestId('gap-last-diaper'),
   typeButtons: [...document.querySelectorAll('.seg-btn')],
-  amountPanel: document.getElementById('amountPanel'),
-  amountHint: document.getElementById('amountHint'),
-  directPanel: document.getElementById('directPanel'),
+  amountPanel: byTestId('amount-panel'),
+  amountHint: byTestId('amount-hint'),
+  bottleTip: byTestId('bottle-tip'),
+  directPanel: byTestId('direct-panel'),
   chips: [...document.querySelectorAll('.chip')],
   customForm: document.getElementById('customForm'),
   customInput: byTestId('custom-amount-input'),
@@ -87,6 +97,7 @@ const els = {
   errorBanner: byTestId('load-error'),
   errorText: document.getElementById('loadErrorText'),
   retryBtn: byTestId('retry-load'),
+  exportLink: byTestId('export-csv'),
   toastRoot: document.getElementById('toastRoot'),
   recordButtons: [...document.querySelectorAll('.record-btn')],
 };
@@ -138,50 +149,41 @@ function currentDateKey() {
   return state.today && typeof state.today.date === 'string' ? state.today.date : formatDayKey(Date.now());
 }
 
-function readStoredFeedType() {
-  try {
-    const stored = localStorage.getItem(FEED_TYPE_STORAGE_KEY);
-    if (FEED_TYPES.includes(stored)) return stored;
-  } catch {
-    /* localStorage 不可用时静默降级 */
-  }
-  return 'formula';
+/** 选中集合是否含瓶喂标签（奶粉 / 母乳·瓶喂）→ 需要奶量 */
+function hasBottleType(types) {
+  return types.includes('formula') || types.includes('breast_milk');
 }
 
-class ApiError extends Error {
-  constructor(message) {
-    super(message);
-    this.name = 'ApiError';
-  }
+function eventFeedTypes(event) {
+  if (Array.isArray(event.feedTypes)) return event.feedTypes;
+  if (typeof event.feedType === 'string') return [event.feedType];
+  return [];
 }
 
-async function request(path, options = {}) {
-  let response;
+function readStoredFeedTypes() {
   try {
-    response = await fetch(path, options);
-  } catch {
-    throw new ApiError('网络连接失败，请检查服务是否正常运行');
-  }
-  let payload = null;
-  if (response.status !== 204) {
-    try {
-      payload = await response.json();
-    } catch {
-      payload = null;
+    const raw = localStorage.getItem(FEED_TYPES_STORAGE_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      const types = sortFeedTypes(Array.isArray(parsed) ? parsed : []);
+      if (types.length > 0) return types;
     }
+    // v1 迁移：旧的单值 'naiji.feedType'
+    const legacy = localStorage.getItem(LEGACY_FEED_TYPE_STORAGE_KEY);
+    if (FEED_TYPES.includes(legacy)) return [legacy];
+  } catch {
+    /* localStorage 不可用时静默降级为默认值 */
   }
-  if (!response.ok) {
-    const message =
-      payload && typeof payload.message === 'string' && payload.message
-        ? payload.message
-        : `请求失败（HTTP ${response.status}）`;
-    throw new ApiError(message);
-  }
-  return payload;
+  return ['formula'];
 }
 
-function stateUrl() {
-  return `/api/state?tzOffset=${new Date().getTimezoneOffset()}`;
+function persistFeedTypes() {
+  try {
+    localStorage.setItem(FEED_TYPES_STORAGE_KEY, JSON.stringify(state.feedTypes));
+    localStorage.removeItem(LEGACY_FEED_TYPE_STORAGE_KEY);
+  } catch {
+    /* 忽略隐私模式下的存储失败 */
+  }
 }
 
 /* --------------------------------------------------------------------------
@@ -224,9 +226,14 @@ function applyTodayAdd(event) {
 
   if (event.kind === 'feed') {
     today.feedCount = (today.feedCount ?? 0) + 1;
-    if (event.feedType === 'formula') today.formulaMl = (today.formulaMl ?? 0) + (event.amountMl ?? 0);
-    else if (event.feedType === 'breast_milk') today.breastMl = (today.breastMl ?? 0) + (event.amountMl ?? 0);
-    else if (event.feedType === 'breast_direct') today.breastDirectCount = (today.breastDirectCount ?? 0) + 1;
+    if (event.amountMl !== null && event.amountMl !== undefined) {
+      today.totalMl = (today.totalMl ?? 0) + event.amountMl;
+    }
+    const types = eventFeedTypes(event);
+    if (types.includes('formula')) today.formulaCount = (today.formulaCount ?? 0) + 1;
+    if (types.includes('breast_milk')) today.breastMilkCount = (today.breastMilkCount ?? 0) + 1;
+    if (types.includes('breast_direct')) today.breastDirectCount = (today.breastDirectCount ?? 0) + 1;
+    if (types.length > 1) today.mixedFeedCount = (today.mixedFeedCount ?? 0) + 1;
   } else if (event.kind === 'diaper') {
     today.diaperCount = (today.diaperCount ?? 0) + 1;
     if (event.diaperKind === 'mixed') {
@@ -239,7 +246,6 @@ function applyTodayAdd(event) {
       today.poopCount = (today.poopCount ?? 0) + 1;
     }
   }
-  today.totalMl = (today.formulaMl ?? 0) + (today.breastMl ?? 0);
 }
 
 function applyTodayRemove(event) {
@@ -249,11 +255,14 @@ function applyTodayRemove(event) {
 
   if (event.kind === 'feed') {
     today.feedCount = Math.max(0, (today.feedCount ?? 0) - 1);
-    if (event.feedType === 'formula') today.formulaMl = Math.max(0, (today.formulaMl ?? 0) - (event.amountMl ?? 0));
-    else if (event.feedType === 'breast_milk') today.breastMl = Math.max(0, (today.breastMl ?? 0) - (event.amountMl ?? 0));
-    else if (event.feedType === 'breast_direct') {
-      today.breastDirectCount = Math.max(0, (today.breastDirectCount ?? 0) - 1);
+    if (event.amountMl !== null && event.amountMl !== undefined) {
+      today.totalMl = Math.max(0, (today.totalMl ?? 0) - event.amountMl);
     }
+    const types = eventFeedTypes(event);
+    if (types.includes('formula')) today.formulaCount = Math.max(0, (today.formulaCount ?? 0) - 1);
+    if (types.includes('breast_milk')) today.breastMilkCount = Math.max(0, (today.breastMilkCount ?? 0) - 1);
+    if (types.includes('breast_direct')) today.breastDirectCount = Math.max(0, (today.breastDirectCount ?? 0) - 1);
+    if (types.length > 1) today.mixedFeedCount = Math.max(0, (today.mixedFeedCount ?? 0) - 1);
   } else if (event.kind === 'diaper') {
     today.diaperCount = Math.max(0, (today.diaperCount ?? 0) - 1);
     if (event.diaperKind === 'mixed') {
@@ -266,7 +275,49 @@ function applyTodayRemove(event) {
       today.poopCount = Math.max(0, (today.poopCount ?? 0) - 1);
     }
   }
-  today.totalMl = (today.formulaMl ?? 0) + (today.breastMl ?? 0);
+}
+
+/* --------------------------------------------------------------------------
+   喂奶类型多选
+   -------------------------------------------------------------------------- */
+
+function renderFeedTypes() {
+  const types = state.feedTypes;
+  for (const button of els.typeButtons) {
+    button.setAttribute('aria-pressed', String(types.includes(button.dataset.feedType)));
+  }
+
+  const bottle = hasBottleType(types);
+  // 奶量面板：选中集合含 formula / breast_milk 时显示
+  els.amountPanel.hidden = !bottle;
+  // 亲喂按钮：只有「仅亲喂」时才显示
+  els.directPanel.hidden = bottle;
+  els.amountHint.textContent = bottle ? ` · ${feedTypesLabel(types)}` : '';
+  // 亲喂 + 瓶喂组合时提示奶量含义
+  els.bottleTip.hidden = !(bottle && types.includes('breast_direct'));
+
+  if (bottle && els.customInput.value.trim() === '') els.customInput.value = '120';
+}
+
+function toggleFeedType(feedType) {
+  if (!FEED_TYPES.includes(feedType)) return;
+  const selected = state.feedTypes.includes(feedType);
+  if (selected && state.feedTypes.length === 1) {
+    // 至少保留一个类型：再点唯一选中项时保持选中，只做轻微提示动画
+    const button = els.typeButtons.find((item) => item.dataset.feedType === feedType);
+    if (button) {
+      button.classList.remove('is-nudge');
+      void button.offsetWidth; // 重启动画
+      button.classList.add('is-nudge');
+    }
+    showToast('至少要保留一种喂奶类型', { type: 'plain', duration: 1600 });
+    return;
+  }
+  const next = selected ? state.feedTypes.filter((type) => type !== feedType) : [...state.feedTypes, feedType];
+  state.feedTypes = sortFeedTypes(next);
+  if (state.feedTypes.length === 0) state.feedTypes = ['formula'];
+  persistFeedTypes();
+  renderFeedTypes();
 }
 
 /* --------------------------------------------------------------------------
@@ -278,6 +329,7 @@ function renderAll() {
   renderSummary();
   renderTimeline();
   renderErrorBanner();
+  renderFeedTypes();
 }
 
 function renderHeroClocks() {
@@ -313,7 +365,16 @@ function renderHero() {
     const fragment = document.createDocumentFragment();
     fragment.append('上次 ');
     fragment.append(makeEl('span', 'hero-last-clock', formatClock(state.lastFeeding.happenedAt)));
-    fragment.append(` · ${eventTitle(state.lastFeeding)}`);
+    fragment.append(' · ');
+    // 奶量整体 nowrap：窄屏（320px）换行时不要把「120 ml」拆成两行
+    const title = eventTitle(state.lastFeeding);
+    const amountMatch = /^(.*?)(\s\d+(?:\.\d+)?\s?ml)$/.exec(title);
+    if (amountMatch) {
+      fragment.append(amountMatch[1]);
+      fragment.append(makeEl('span', 'hero-last-amount', amountMatch[2]));
+    } else {
+      fragment.append(title);
+    }
     els.gapLastFeed.replaceChildren(fragment);
   } else if (state.error) {
     els.gapLastFeed.textContent = '加载失败，请点上方「重试」';
@@ -334,6 +395,7 @@ function renderSummary() {
     return;
   }
 
+  // v2 汇总：喂奶 N 次 · 奶量 M ml · 亲喂 K 次 · 小便 X · 大便 Y
   const parts = [
     ['喂奶 ', today.feedCount ?? 0, ' 次'],
     ['奶量 ', today.totalMl ?? 0, ' ml'],
@@ -370,6 +432,26 @@ function groupEventsByDay(events) {
   return groups;
 }
 
+/**
+ * 时间线标题：奶量部分整体不换行（避免「120 ml」被拆成两行只剩 "ml"），
+ * DOM textContent 与 eventTitle(event) 完全一致（tests/QA 依赖）。
+ */
+function buildEventTitle(event) {
+  const title = makeEl('p', 'event-title');
+  if (event && event.kind === 'feed') {
+    const label = feedTypesLabel(eventFeedTypes(event));
+    const amount = formatAmount(event.amountMl);
+    if (label && amount) {
+      title.append(makeEl('span', 'event-title-label', label));
+      title.append(' ');
+      title.append(makeEl('span', 'event-title-amount', amount));
+      return title;
+    }
+  }
+  title.textContent = eventTitle(event);
+  return title;
+}
+
 function renderEventItem(event) {
   const item = makeEl('li', 'event');
   item.dataset.eventId = String(event.id);
@@ -382,7 +464,7 @@ function renderEventItem(event) {
 
   const body = makeEl('div', 'event-body');
   const top = makeEl('div', 'event-top');
-  top.append(makeEl('p', 'event-title', eventTitle(event)));
+  top.append(buildEventTitle(event));
   top.append(makeEl('span', 'event-time', formatClock(event.happenedAt)));
   body.append(top);
   if (event.note) body.append(makeEl('p', 'event-note', event.note));
@@ -390,7 +472,7 @@ function renderEventItem(event) {
   const remove = makeEl('button', 'event-delete', '×');
   remove.type = 'button';
   remove.title = '删除这条记录';
-  remove.setAttribute('aria-label', `删除 ${formatClock(event.happenedAt)} 的${eventTitle(event)}记录`);
+  remove.setAttribute('aria-label', `删除 ${formatClock(event.happenedAt)} 的记录：${eventTitle(event)}`);
   remove.disabled = writeInFlight > 0 || state.deletingIds.has(event.id);
 
   item.append(icon, body, remove);
@@ -552,6 +634,8 @@ function showToast(message, { type = 'plain', undo = null, duration = null } = {
   } else if (type === 'error') {
     toast.classList.add('toast--error');
     toast.append(makeEl('span', 'toast-emoji', '⚠️'));
+  } else if (type === 'info') {
+    toast.append(makeEl('span', 'toast-emoji', 'ℹ️'));
   }
 
   toast.append(makeEl('span', 'toast-message', message));
@@ -606,12 +690,29 @@ function handleEventRemoved(event) {
   renderAll();
 }
 
-async function createFeeding(feedType, amountMl = null) {
-  if (!FEED_TYPES.includes(feedType) || writeInFlight > 0) return;
+/**
+ * 记录一次喂奶：feedTypes = 当前全部选中标签；含奶粉/母乳时带 amountMl（总奶量）。
+ * 仅亲喂时 amountMl 必须为 null（不带该字段）。
+ */
+async function recordFeeding(amountMl = null) {
+  if (writeInFlight > 0 || !state.loaded) return;
+  const types = [...state.feedTypes];
+  if (types.length === 0) return;
+
+  const needsAmount = hasBottleType(types);
+  let amount = null;
+  if (needsAmount) {
+    if (!Number.isInteger(amountMl) || amountMl < MIN_AMOUNT_ML || amountMl > MAX_AMOUNT_ML) {
+      showToast(`奶量必须是 ${MIN_AMOUNT_ML} 到 ${MAX_AMOUNT_ML} 之间的整数（毫升）`, { type: 'error' });
+      return;
+    }
+    amount = amountMl;
+  }
+
   lockWrites();
   try {
-    const payload = { feedType };
-    if (feedType !== 'breast_direct') payload.amountMl = amountMl;
+    const payload = { feedTypes: types };
+    if (needsAmount) payload.amountMl = amount;
     const data = await request('/api/feedings', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -630,8 +731,8 @@ async function createFeeding(feedType, amountMl = null) {
   }
 }
 
-async function createDiaper(diaperKind) {
-  if (writeInFlight > 0) return;
+async function recordDiaper(diaperKind) {
+  if (writeInFlight > 0 || !state.loaded) return;
   lockWrites();
   try {
     const data = await request('/api/diapers', {
@@ -654,7 +755,7 @@ async function createDiaper(diaperKind) {
 
 async function undoCreatedEvent(event) {
   const removed = await deleteEventById(event.id);
-  if (removed) showToast(`已撤销「${eventTitle(event)}」`, { duration: 1800 });
+  if (removed) showToast(`已撤销「${eventTitle(event)}」`, { duration: TOAST_SHORT_MS });
   return removed;
 }
 
@@ -686,29 +787,10 @@ async function deleteEventById(id) {
    交互
    -------------------------------------------------------------------------- */
 
-function setFeedType(feedType, { persist = true } = {}) {
-  const next = FEED_TYPES.includes(feedType) ? feedType : 'formula';
-  state.feedType = next;
-  if (persist) {
-    try {
-      localStorage.setItem(FEED_TYPE_STORAGE_KEY, next);
-    } catch {
-      /* 忽略隐私模式下的存储失败 */
-    }
-  }
-  for (const button of els.typeButtons) {
-    button.setAttribute('aria-pressed', String(button.dataset.feedType === next));
-  }
-  const isDirect = next === 'breast_direct';
-  els.amountPanel.hidden = isDirect;
-  els.directPanel.hidden = !isDirect;
-  if (els.amountHint) els.amountHint.textContent = isDirect ? '' : ` · ${feedTypeLabel(next)}`;
-  if (!isDirect && els.customInput.value.trim() === '') els.customInput.value = '120';
-}
-
 function handleCustomAmountSubmit(domEvent) {
   domEvent.preventDefault();
-  if (writeInFlight > 0 || state.feedType === 'breast_direct') return;
+  if (writeInFlight > 0) return;
+  if (!hasBottleType(state.feedTypes)) return;
 
   const raw = els.customInput.value.trim();
   const amount = Number(raw);
@@ -717,7 +799,7 @@ function handleCustomAmountSubmit(domEvent) {
     els.customInput.focus();
     return;
   }
-  void createFeeding(state.feedType, amount);
+  void recordFeeding(amount);
 }
 
 function handleHistoryClick(domEvent) {
@@ -729,7 +811,7 @@ function handleHistoryClick(domEvent) {
   if (!window.confirm('确定删除这条记录吗？删除后无法恢复。')) return;
   void (async () => {
     const removed = await deleteEventById(id);
-    if (removed) showToast('已删除这条记录', { duration: 1800 });
+    if (removed) showToast('已删除这条记录', { duration: TOAST_SHORT_MS });
   })();
 }
 
@@ -768,21 +850,21 @@ async function loadMore() {
 
 function bindEvents() {
   for (const button of els.typeButtons) {
-    button.addEventListener('click', () => setFeedType(button.dataset.feedType));
+    button.addEventListener('click', () => toggleFeedType(button.dataset.feedType));
   }
 
   for (const chip of els.chips) {
     chip.addEventListener('click', () => {
-      if (state.feedType === 'breast_direct') return;
+      if (!hasBottleType(state.feedTypes)) return;
       const amount = Number(chip.dataset.amount);
-      if (Number.isInteger(amount)) void createFeeding(state.feedType, amount);
+      if (Number.isInteger(amount)) void recordFeeding(amount);
     });
   }
 
   els.customForm.addEventListener('submit', handleCustomAmountSubmit);
-  els.breastDirectBtn.addEventListener('click', () => void createFeeding('breast_direct'));
-  els.peeBtn.addEventListener('click', () => void createDiaper('pee'));
-  els.poopBtn.addEventListener('click', () => void createDiaper('poop'));
+  els.breastDirectBtn.addEventListener('click', () => void recordFeeding());
+  els.peeBtn.addEventListener('click', () => void recordDiaper('pee'));
+  els.poopBtn.addEventListener('click', () => void recordDiaper('poop'));
   els.loadMore.addEventListener('click', () => void loadMore());
   els.retryBtn.addEventListener('click', () => {
     if (!state.loading) void loadState();
@@ -797,7 +879,10 @@ function bindEvents() {
 }
 
 function init() {
-  setFeedType(state.feedType, { persist: false });
+  // 导出链接同样走 apiUrl()，前后端分离时指向 API 服务器
+  if (els.exportLink) els.exportLink.href = apiUrl('/api/export.csv');
+
+  renderFeedTypes();
   bindEvents();
   syncRecordButtons();
   renderAll();
