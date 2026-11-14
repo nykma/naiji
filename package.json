@@ -26,5 +26,5 @@
     "sqlite",
     "cli"
   ],
-  "license": "UNLICENSED"
+  "license": "MIT"
 }

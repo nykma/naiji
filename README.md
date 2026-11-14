@@ -213,3 +213,7 @@ nohup node server/src/server.js > milk.log 2>&1 &
 ```
 
 或用自己的进程管理器（systemd / tmux）。单用户家庭内网使用，未做多用户与鉴权——**不建议直接暴露到公网**。
+
+## License
+
+[MIT](LICENSE) © 2026 Nyk Ma
