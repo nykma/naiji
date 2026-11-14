@@ -38,6 +38,9 @@ const TOAST_UNDO_MS = 5000;
 const TOAST_ERROR_MS = 4200;
 const TOAST_PLAIN_MS = 3000;
 const TOAST_SHORT_MS = 1800;
+// 浏览器标签标题：有上次喂奶时显示「距上次 X 小时 X 分钟 · 奶记」，方便瞥一眼
+const BASE_TITLE = '奶记 · 婴儿喂养记录';
+const TITLE_NAME = '奶记';
 
 /* --------------------------------------------------------------------------
    状态
@@ -111,6 +114,24 @@ function makeEl(tag, className, text) {
   if (className) node.className = className;
   if (text !== undefined && text !== null) node.textContent = text;
   return node;
+}
+
+/** 更新浏览器标签标题（相同则跳过，避免每秒无意义写入） */
+function setDocumentTitle(title) {
+  if (document.title !== title) document.title = title;
+}
+
+/**
+ * 标签标题文案：
+ * - 有上次喂奶且 ≥ 1 分钟：「距上次 3 小时 25 分钟 · 奶记」
+ * - 不到 1 分钟：「刚刚喂过 · 奶记」
+ * - 还没有记录 / 未加载：默认标题
+ */
+function documentTitleFor(lastFeeding, now) {
+  if (!lastFeeding) return BASE_TITLE;
+  const gapMs = Math.max(0, now - lastFeeding.happenedAt);
+  if (gapMs < 60_000) return `刚刚喂过 · ${TITLE_NAME}`;
+  return `距上次 ${formatDuration(gapMs)} · ${TITLE_NAME}`;
 }
 
 function compareEventsDesc(a, b) {
@@ -344,6 +365,9 @@ function renderHeroClocks() {
     if (els.gapDuration.textContent !== emptyText) els.gapDuration.textContent = emptyText;
     els.gapDuration.classList.add('is-empty');
   }
+
+  // 浏览器标签标题同步显示「距上次 X 小时 X 分钟」，切到别的标签时也能瞥一眼
+  setDocumentTitle(documentTitleFor(state.lastFeeding, now));
 
   let diaperText;
   if (state.lastDiaper) {

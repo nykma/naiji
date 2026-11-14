@@ -212,6 +212,7 @@ diaper：`feedTypes: null, amountMl: null, diaperKind: "pee"`。
 - 仅选中 `breast_direct` 时：显示「🤱 亲喂一次」按钮（`record-breast-direct`），`POST { feedTypes: ["breast_direct"] }`。
 - 同时选中亲喂 + 瓶喂标签时：仍显示奶量面板，并给一行小提示「奶量填写本次补充的瓶喂量」。
 - 时间线/今日汇总：标题用 `eventTitle(event)`（如「奶粉 + 母乳（瓶喂） 120 ml」）；今日汇总格式「喂奶 N 次 · 奶量 M ml · 亲喂 K 次 · 小便 X · 大便 Y」。
+- **浏览器标签标题（document.title）**：有上次喂奶时显示 `距上次 X 小时 X 分钟 · 奶记`（用 `formatDuration`，与 Hero 同源、随 Hero 每秒刷新；不足 1 分钟时显示 `刚刚喂过 · 奶记`）；没有记录/未加载时为 `奶记 · 婴儿喂养记录`。用于切到其他标签页时瞥一眼间隔。
 - 其余（Hero 实时「距离上次喂奶 X 小时 X 分钟」、撤销 toast、时间线按天分组、加载更多、删除确认、加载失败重试、深色模式、PWA、`data-testid` 集合）与 v1 相同，不得回退。
 
 ### 6.3 web/lib/format.js（浏览器 + tests 共用，测试依赖）
