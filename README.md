@@ -12,6 +12,10 @@ v2 已拆成前后端分离的三部分，彼此只通过 HTTP API 通信：
 
 数据存一个 SQLite 文件（默认 `data/baby.db`），复制即备份。手机和 CLI 可以连同一个后端，记录实时同步。
 
+<p align="center">
+  <img src="docs/screenshots/hero-390.png" width="400" alt="奶记手机端主界面：距离上次喂奶实时显示、奶粉/母乳/亲喂多选一键记录、今日汇总与时间线" />
+</p>
+
 ## 功能
 
 | 功能 | 说明 |
@@ -194,7 +198,7 @@ baby-milk-tracker/
 | `DELETE` | `/api/events/:id` | 删除一条记录 |
 | `GET` | `/api/export.csv` | 导出全部记录 |
 
-## 界面预览
+## 更多截图
 
 | 手机 · 多选记录（奶粉 + 母乳） | 手机 · 深色 | 前后端分离 · 跨源部署 |
 | --- | --- | --- |
