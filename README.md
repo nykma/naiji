@@ -61,6 +61,21 @@ node cli/bin/naiji.mjs status    # CLI
 
 手机连同一 WiFi 打开局域网地址即可；iOS「分享 → 添加到主屏幕」、Android Chrome「添加到主屏幕」后可像 App 一样用。
 
+### 方式三：Docker（后端 + web 单容器打包，推荐给家用 NAS / 服务器）
+
+```bash
+cd baby-milk-tracker
+docker compose up -d --build     # 默认 http://127.0.0.1:3000
+docker compose ps                # 等 STATUS 出现 (healthy)
+docker compose logs -f           # 启动日志（含局域网访问地址）
+```
+
+- 单容器同时提供 API 和 web 页面；镜像 `naiji:2.0.0`（Node 24 alpine，零依赖、无构建步骤、非 root、内置健康检查），约 173 MB
+- 数据在 Docker 命名卷 `naiji_naiji-data`（容器内 `/app/data/baby.db`），`docker compose down` 不会丢数据
+- 改端口 / 时区：`NAIJI_PORT=8080 docker compose up -d`、`TZ=Asia/Tokyo docker compose up -d`
+- 容器内也带 CLI：`docker compose exec naiji naiji status`
+- 备份 / 恢复 / 迁移宿主机旧数据 / 前后端分离部署，详见 [docs/DOCKER.md](docs/DOCKER.md)
+
 ## CLI 用法（电脑上）
 
 ```bash
@@ -101,6 +116,7 @@ node scripts/serve-web.mjs --port 8080 --api http://192.168.1.23:3000
 - API 基址可在 `web/config.js`（`window.NAIJI_CONFIG.apiBase`）、URL 参数 `?api=`、或 localStorage 中配置。
 - 后端 CORS 默认 `CORS_ORIGINS=*`；要收紧就设成具体来源，如 `CORS_ORIGINS=http://192.168.1.23:8080`。
 - 部署到 nginx/GitHub Pages 等静态主机时，把 `apiBase` 指向后端地址即可（后端需允许该来源 CORS）。
+- Docker 部署想分离：给服务加 `SERVE_WEB: "0"`，web 交给 nginx/静态主机；示例见 [docs/DOCKER.md](docs/DOCKER.md) 第 3 节。
 
 ## 配置（server 环境变量）
 
@@ -153,8 +169,12 @@ baby-milk-tracker/
 ├── test/                # server + web/lib 测试（node:test）
 ├── cli/test/            # CLI 测试
 ├── scripts/             # serve-web.mjs、browser-e2e.mjs（QA）
+├── Dockerfile           # 生产镜像：后端 API + web 前端 + CLI（非 root、健康检查）
+├── docker-compose.yml   # 一键部署（命名卷 naiji_naiji-data 持久化 SQLite）
+├── .dockerignore
 ├── docs/
 │   ├── CONTRACT.md      # 前后端 + CLI 接口契约（唯一事实来源）
+│   ├── DOCKER.md        # Docker 部署/备份恢复/迁移/前后端分离详解
 │   ├── qa-report.md     # v2 验收报告
 │   └── qa-report-v1.md  # v1 验收报告（归档）
 └── data/                # 运行时生成的 SQLite（gitignore）

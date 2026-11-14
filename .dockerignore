@@ -1,0 +1,22 @@
+# 构建上下文瘦身：镜像里只需要 package.json + server/ + web/ + cli/
+.git
+.gitignore
+.direnv
+.cache
+.envrc
+data
+node_modules
+docs
+scripts
+test
+cli/test
+*.log
+*.db
+*.db-shm
+*.db-wal
+Dockerfile
+docker-compose.yml
+.dockerignore
+README.md
+flake.nix
+flake.lock

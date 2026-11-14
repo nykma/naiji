@@ -1,0 +1,51 @@
+# 奶记 · 婴儿喂养记录 —— Docker Compose 部署
+#
+# 用法：
+#   docker compose up -d --build      # 构建并启动（默认 http://127.0.0.1:3000）
+#   docker compose logs -f            # 看日志
+#   docker compose down               # 停止（保留数据卷）
+#   docker compose down -v            # 停止并删除数据卷（危险：清空记录）
+#
+# 常用覆盖：
+#   NAIJI_PORT=8080 docker compose up -d        # 改宿主机端口
+#   TZ=Asia/Tokyo docker compose up -d          # 改时区
+#   见 docs/DOCKER.md 的「配置」与「备份/恢复/迁移」章节
+
+name: naiji
+
+services:
+  naiji:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        NODE_IMAGE: ${NODE_IMAGE:-node:24-alpine}
+    image: naiji:2.0.0
+    restart: unless-stopped
+    init: true
+    ports:
+      # 宿主机端口可用 NAIJI_PORT 覆盖，容器内固定 3000
+      - "${NAIJI_PORT:-3000}:3000"
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+      # 默认单容器：server 同时托管 web/。以下按需取消注释：
+      #
+      # 前后端分离：只跑 API，web 由 nginx / 任意静态主机托管（需另一处部署 web/）
+      # SERVE_WEB: "0"
+      #
+      # 收紧跨源来源（默认 *，家庭内网够用；公网/多设备时建议指定）
+      # CORS_ORIGINS: "http://192.168.1.23:8080"
+    volumes:
+      # SQLite 数据；实际卷名为 <项目名>_naiji-data，默认项目名 naiji → naiji_naiji-data
+      - naiji-data:/app/data
+    security_opt:
+      - no-new-privileges:true
+    # 健康检查继承自镜像 HEALTHCHECK（docker compose ps 的 STATUS 会显示 healthy）
+    # 资源限制示例（按需取消注释）：
+    # deploy:
+    #   resources:
+    #     limits:
+    #       memory: 256M
+
+volumes:
+  naiji-data:
