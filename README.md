@@ -25,6 +25,7 @@ v2 已拆成前后端分离的三部分，彼此只通过 HTTP API 通信：
 | ⏱ 距上次喂奶 | 大字实时刷新「3 小时 25 分钟」，另显示上次详情、距上次换尿布时间；**浏览器标签标题**也显示「距上次 X · 奶记」，切标签也能瞥一眼 |
 | 📊 今日汇总 | 喂奶次数、总奶量、亲喂次数、大小便次数 |
 | 🕘 时间线 | 按天分组，删除、记录后 5 秒内撤销 |
+| 🔄 多人实时同步 | 家里几个人同时用：谁记录/删除，所有打开的页面**无需刷新**立即同步（SSE 长连接）；顶栏还有手动「刷新」按钮兜底 |
 | 📤 导出 CSV | 带 BOM，Excel 可直接打开不乱码 |
 | 💻 CLI | `naiji` 无参数即看状态；`naiji f 120` 记录；`naiji log` 看历史；支持 `--ago` 回溯补记 |
 | 🔗 前后端分离 | web 可单独托管，跨源访问 API（已内置 CORS）；手机、电脑 CLI 共用一个后端 |
@@ -195,6 +196,7 @@ baby-milk-tracker/
 | `POST` | `/api/feedings` | 记录喂奶 `{feedTypes: ["formula","breast_milk"], amountMl: 120}` |
 | `POST` | `/api/diapers` | 记录大小便 `{diaperKind: "pee"\|"poop"\|"mixed"}` |
 | `GET` | `/api/events?limit=50&before=&beforeId=` | 历史记录（复合游标分页） |
+| `GET` | `/api/events/stream` | **SSE 实时推送**：任何一端新增/删除记录后广播给所有页面 |
 | `DELETE` | `/api/events/:id` | 删除一条记录 |
 | `GET` | `/api/export.csv` | 导出全部记录 |
 

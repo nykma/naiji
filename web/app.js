@@ -49,6 +49,7 @@ const TITLE_NAME = '奶记';
 const state = {
   loaded: false,
   loading: false,
+  refreshing: false,
   error: null,
   lastFeeding: null,
   lastDiaper: null,
@@ -64,6 +65,9 @@ const state = {
 let writeInFlight = 0;
 let newEventId = null;
 let toastHideTimer = null;
+let eventStream = null;
+let sseEverConnected = false;
+let fallbackPollTimer = null;
 
 /* --------------------------------------------------------------------------
    DOM
@@ -100,6 +104,7 @@ const els = {
   errorBanner: byTestId('load-error'),
   errorText: document.getElementById('loadErrorText'),
   retryBtn: byTestId('retry-load'),
+  refreshBtn: byTestId('refresh'),
   exportLink: byTestId('export-csv'),
   toastRoot: document.getElementById('toastRoot'),
   recordButtons: [...document.querySelectorAll('.record-btn')],
@@ -224,6 +229,7 @@ function syncRecordButtons() {
   for (const button of els.recordButtons) button.disabled = disabled;
   document.body.classList.toggle('is-busy', writeInFlight > 0);
   syncDeleteButtons();
+  syncRefreshButton();
 }
 
 function lockWrites() {
@@ -577,6 +583,7 @@ function applyServerState(data) {
 async function loadState({ silent = false } = {}) {
   if (state.loading) return;
   state.loading = true;
+  syncRefreshButton();
   if (!silent) {
     state.error = null;
     renderErrorBanner();
@@ -620,6 +627,123 @@ function checkDayRollover(now) {
   state.rolloverChecking = true;
   refreshStateQuietly().finally(() => {
     state.rolloverChecking = false;
+  });
+}
+
+/* --------------------------------------------------------------------------
+   刷新 / 多端实时同步（SSE，降级轮询）
+   -------------------------------------------------------------------------- */
+
+const SSE_PATH = '/api/events/stream';
+const FALLBACK_POLL_MS = 30_000;
+
+function syncRefreshButton() {
+  if (!els.refreshBtn) return;
+  const busy = Boolean(state.refreshing) || state.loading || writeInFlight > 0;
+  els.refreshBtn.disabled = busy;
+  els.refreshBtn.classList.toggle('is-refreshing', Boolean(state.refreshing));
+  els.refreshBtn.setAttribute('aria-busy', String(Boolean(state.refreshing)));
+}
+
+/** 手动刷新：以服务端为准重置时间线（回到最新一页）与聚合状态 */
+function applyServerStateFresh(data) {
+  if (!data || typeof data !== 'object') throw new ApiError('服务返回的数据格式不正确');
+  state.lastFeeding = data.lastFeeding ?? null;
+  state.lastDiaper = data.lastDiaper ?? null;
+  state.today = data.today ?? null;
+  const recent = Array.isArray(data.recent) ? data.recent : [];
+  state.events = recent;
+  state.hasMore = recent.length >= RECENT_LIMIT;
+  state.loaded = true;
+  state.error = null;
+}
+
+/**
+ * 主动向服务端拉一次最新状态。
+ * @param {{ silent?: boolean }} [options] silent=true 时不弹 toast（自动刷新用）
+ */
+async function refreshNow({ silent = false } = {}) {
+  if (state.refreshing || state.loading || writeInFlight > 0) return false;
+  state.refreshing = true;
+  syncRefreshButton();
+  try {
+    const data = await request(stateUrl());
+    applyServerStateFresh(data);
+    renderAll();
+    if (!silent) showToast('已刷新最新数据', { duration: TOAST_SHORT_MS });
+    return true;
+  } catch (error) {
+    console.error('[奶记] 刷新失败:', error);
+    if (!silent) showToast(error.message, { type: 'error' });
+    return false;
+  } finally {
+    state.refreshing = false;
+    syncRefreshButton();
+  }
+}
+
+/** 处理服务端推送的变更（其他设备/浏览器记录或删除） */
+function handleRealtimeChange(payload) {
+  if (!payload || typeof payload !== 'object') return;
+
+  if (payload.type === 'delete') {
+    const target = state.events.find((event) => event.id === payload.id);
+    if (target) handleEventRemoved(target);
+    return;
+  }
+
+  const event = payload.event;
+  if (!event || !Number.isInteger(event.id)) return;
+  // 自己刚记录时本地已经应用过，跳过 SSE 回声
+  if (state.events.some((item) => item.id === event.id)) return;
+
+  handleEventCreated(event);
+  // 撤销 toast 还在时不要打断（不然会顶掉「撤销」按钮）
+  const currentToast = els.toastRoot.firstElementChild;
+  const undoVisible = Boolean(currentToast && currentToast.classList.contains('toast--undo'));
+  if (!undoVisible) showToast(`已同步 ${eventTitle(event)}`, { duration: TOAST_SHORT_MS });
+}
+
+function startFallbackPolling() {
+  if (fallbackPollTimer) return;
+  console.warn('[奶记] 当前浏览器不支持 EventSource，降级为每 30 秒轮询');
+  fallbackPollTimer = window.setInterval(() => {
+    if (!document.hidden && writeInFlight === 0) void refreshNow({ silent: true });
+  }, FALLBACK_POLL_MS);
+}
+
+function connectEventStream() {
+  if (typeof EventSource !== 'function') {
+    startFallbackPolling();
+    return;
+  }
+  try {
+    eventStream = new EventSource(apiUrl(SSE_PATH));
+  } catch (error) {
+    console.warn('[奶记] 无法建立实时连接，降级为轮询:', error);
+    startFallbackPolling();
+    return;
+  }
+
+  eventStream.addEventListener('change', (domEvent) => {
+    let payload = null;
+    try {
+      payload = JSON.parse(domEvent.data);
+    } catch {
+      return;
+    }
+    handleRealtimeChange(payload);
+  });
+
+  eventStream.addEventListener('open', () => {
+    // 首次连接不需要额外请求；断线重连后以服务端为准校准一次，补上断线期间漏掉的变更
+    if (sseEverConnected) void refreshNow({ silent: true });
+    sseEverConnected = true;
+  });
+
+  eventStream.addEventListener('error', () => {
+    // EventSource 会按服务端下发的 retry 自动重连，这里只记录日志
+    console.warn('[奶记] 实时连接已断开，正在自动重连…');
   });
 }
 
@@ -688,7 +812,15 @@ function showToast(message, { type = 'plain', undo = null, duration = null } = {
    记录 / 删除
    -------------------------------------------------------------------------- */
 
+/**
+ * 应用一条新记录（幂等：同一 id 只应用一次）。
+ * 自己 POST 的响应与 SSE 回声谁先到谁应用，后到的一方直接跳过，
+ * 避免今日汇总/时间线被重复计算。
+ */
 function handleEventCreated(event) {
+  if (!event || !Number.isInteger(event.id)) return;
+  if (state.events.some((item) => item.id === event.id)) return;
+
   insertEventSorted(event);
 
   if (event.kind === 'feed') {
@@ -703,9 +835,15 @@ function handleEventCreated(event) {
   if (!state.loaded) void loadState();
 }
 
+/**
+ * 移除一条记录（幂等：本地已不存在则什么都不做）。
+ * DELETE 响应与 SSE 删除回声同理，避免重复扣减今日汇总。
+ */
 function handleEventRemoved(event) {
+  if (!event || !Number.isInteger(event.id)) return;
   const index = state.events.findIndex((item) => item.id === event.id);
-  if (index !== -1) state.events.splice(index, 1);
+  if (index === -1) return;
+  state.events.splice(index, 1);
   applyTodayRemove(event);
 
   if (state.lastFeeding && state.lastFeeding.id === event.id) state.lastFeeding = findLatestOfKind('feed');
@@ -890,13 +1028,17 @@ function bindEvents() {
   els.peeBtn.addEventListener('click', () => void recordDiaper('pee'));
   els.poopBtn.addEventListener('click', () => void recordDiaper('poop'));
   els.loadMore.addEventListener('click', () => void loadMore());
+  els.refreshBtn.addEventListener('click', () => void refreshNow());
   els.retryBtn.addEventListener('click', () => {
     if (!state.loading) void loadState();
   });
   els.history.addEventListener('click', handleHistoryClick);
 
   document.addEventListener('visibilitychange', () => {
-    if (!document.hidden) renderHeroClocks();
+    if (document.hidden) return;
+    renderHeroClocks();
+    // 回到页面时静默校准一次（多端场景：别人可能在你切走期间记录过）
+    if (state.loaded && !state.loading && writeInFlight === 0) void refreshStateQuietly();
   });
 
   window.setInterval(renderHeroClocks, CLOCK_TICK_MS);
@@ -908,9 +1050,11 @@ function init() {
 
   renderFeedTypes();
   bindEvents();
+  syncRefreshButton();
   syncRecordButtons();
   renderAll();
-  void loadState();
+  // 首屏数据到位后再建立实时连接，避免加载竞态
+  void loadState().finally(() => connectEventStream());
 }
 
 init();

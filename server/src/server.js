@@ -116,6 +116,116 @@ function handleCorsPreflight(res) {
 }
 
 // ---------------------------------------------------------------------------
+// SSE 实时推送（多端同步）
+// ---------------------------------------------------------------------------
+
+const SSE_HEARTBEAT_MS = 25_000;
+
+/**
+ * 极简 SSE hub：维护 /api/events/stream 的客户端连接，记录增删时广播 change 事件。
+ * 帧格式：
+ *   retry: 3000                       ← 浏览器自动重连间隔
+ *   : connected                       ← 连接成功注释帧
+ *   event: change
+ *   data: {"type":"feed","event":{...}}   ← 新增记录
+ *   data: {"type":"delete","id":12}       ← 删除记录
+ *   : ping                            ← 心跳（默认 25s，防代理/浏览器空闲断开）
+ *
+ * @param {{ heartbeatMs?: number }} [options]
+ */
+function createSseHub({ heartbeatMs = SSE_HEARTBEAT_MS } = {}) {
+  const clients = new Set();
+  let heartbeatTimer = null;
+
+  function stopHeartbeatIfIdle() {
+    if (clients.size === 0 && heartbeatTimer) {
+      clearInterval(heartbeatTimer);
+      heartbeatTimer = null;
+    }
+  }
+
+  function ensureHeartbeat() {
+    if (heartbeatTimer) return;
+    heartbeatTimer = setInterval(() => {
+      for (const client of clients) {
+        try {
+          client.write(': ping\n\n');
+        } catch {
+          clients.delete(client);
+        }
+      }
+      stopHeartbeatIfIdle();
+    }, heartbeatMs);
+    heartbeatTimer.unref?.();
+  }
+
+  function add(req, res) {
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream; charset=utf-8',
+      'Cache-Control': 'no-cache, no-transform',
+      Connection: 'keep-alive',
+      'X-Accel-Buffering': 'no',
+    });
+    res.write('retry: 3000\n\n');
+    res.write(': connected\n\n');
+    clients.add(res);
+    ensureHeartbeat();
+
+    let cleanedUp = false;
+    const cleanup = () => {
+      if (cleanedUp) return;
+      cleanedUp = true;
+      clients.delete(res);
+      stopHeartbeatIfIdle();
+    };
+    req.on('close', cleanup);
+    res.on('close', cleanup);
+    res.on('error', cleanup);
+  }
+
+  /**
+   * @param {'feed'|'diaper'|'delete'} type
+   * @param {Record<string, unknown>} payload
+   */
+  function broadcast(type, payload) {
+    if (clients.size === 0) return;
+    const frame = `event: change\ndata: ${JSON.stringify({ type, ...payload })}\n\n`;
+    for (const client of clients) {
+      try {
+        client.write(frame);
+      } catch {
+        clients.delete(client);
+      }
+    }
+    stopHeartbeatIfIdle();
+  }
+
+  function closeAll() {
+    if (heartbeatTimer) {
+      clearInterval(heartbeatTimer);
+      heartbeatTimer = null;
+    }
+    for (const client of clients) {
+      try {
+        client.end();
+      } catch {
+        // 连接可能已断开，忽略
+      }
+    }
+    clients.clear();
+  }
+
+  return {
+    add,
+    broadcast,
+    closeAll,
+    get size() {
+      return clients.size;
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------
 // 请求体解析与校验
 // ---------------------------------------------------------------------------
 
@@ -301,7 +411,7 @@ function handleListEvents(_req, res, url, store) {
   sendJson(res, 200, { events: store.listEvents({ limit, before, beforeId }) });
 }
 
-async function handleCreateFeeding(req, res, store, nowMs) {
+async function handleCreateFeeding(req, res, store, nowMs, hub) {
   const body = await readJsonBody(req);
   if (!body.ok) return sendError(res, body.status, body.code, body.message);
 
@@ -330,9 +440,10 @@ async function handleCreateFeeding(req, res, store, nowMs) {
     createdAt: nowMs,
   });
   sendJson(res, 201, { event });
+  hub?.broadcast('feed', { event });
 }
 
-async function handleCreateDiaper(req, res, store, nowMs) {
+async function handleCreateDiaper(req, res, store, nowMs, hub) {
   const body = await readJsonBody(req);
   if (!body.ok) return sendError(res, body.status, body.code, body.message);
 
@@ -352,12 +463,14 @@ async function handleCreateDiaper(req, res, store, nowMs) {
     createdAt: nowMs,
   });
   sendJson(res, 201, { event });
+  hub?.broadcast('diaper', { event });
 }
 
-function handleDeleteEvent(res, id, store) {
+function handleDeleteEvent(res, id, store, hub) {
   if (!store.deleteEvent(id)) return sendError(res, 404, 'not_found', '记录不存在');
   res.writeHead(204, { 'Cache-Control': 'no-store' });
   res.end();
+  hub?.broadcast('delete', { id });
 }
 
 function pad2(n) {
@@ -473,6 +586,7 @@ async function serveStatic(req, res, pathname, webDir) {
  *   serveWeb?: boolean,
  *   corsOrigins?: string[],
  *   now?: () => number,
+ *   sseHeartbeatMs?: number,
  * }} [options]
  */
 export function createApp({
@@ -481,9 +595,11 @@ export function createApp({
   serveWeb = true,
   corsOrigins = ['*'],
   now = () => Date.now(),
+  sseHeartbeatMs = SSE_HEARTBEAT_MS,
 } = {}) {
   const store = openDb(dbPath);
   const allowedOrigins = Array.isArray(corsOrigins) && corsOrigins.length > 0 ? corsOrigins : ['*'];
+  const hub = createSseHub({ heartbeatMs: sseHeartbeatMs });
 
   const server = http.createServer(async (req, res) => {
     const startedAt = Date.now();
@@ -506,18 +622,19 @@ export function createApp({
       if (pathname === '/api/health' && req.method === 'GET') return handleHealth(req, res);
       if (pathname === '/api/state' && req.method === 'GET') return handleState(req, res, url, store, nowMs);
       if (pathname === '/api/events' && req.method === 'GET') return handleListEvents(req, res, url, store);
+      if (pathname === '/api/events/stream' && req.method === 'GET') return hub.add(req, res);
       if (pathname === '/api/feedings' && req.method === 'POST') {
-        return await handleCreateFeeding(req, res, store, nowMs);
+        return await handleCreateFeeding(req, res, store, nowMs, hub);
       }
       if (pathname === '/api/diapers' && req.method === 'POST') {
-        return await handleCreateDiaper(req, res, store, nowMs);
+        return await handleCreateDiaper(req, res, store, nowMs, hub);
       }
       if (pathname === '/api/export.csv' && req.method === 'GET') return handleExportCsv(res, store, nowMs);
 
       const deleteMatch = /^\/api\/events\/([1-9]\d{0,15})$/.exec(pathname);
       if (deleteMatch) {
         if (req.method !== 'DELETE') return sendError(res, 405, 'method_not_allowed', '不支持的请求方法');
-        return handleDeleteEvent(res, Number(deleteMatch[1]), store);
+        return handleDeleteEvent(res, Number(deleteMatch[1]), store, hub);
       }
 
       if (isApi) return sendError(res, 404, 'not_found', '接口不存在');
@@ -545,6 +662,7 @@ export function createApp({
   const close = async () => {
     if (closed) return;
     closed = true;
+    hub.closeAll();
     await new Promise((resolve) => {
       server.close(() => resolve());
       server.closeAllConnections?.();
@@ -552,7 +670,7 @@ export function createApp({
     store.close();
   };
 
-  return { server, store, dbPath, webDir, close };
+  return { server, store, dbPath, webDir, hub, close };
 }
 
 // ---------------------------------------------------------------------------

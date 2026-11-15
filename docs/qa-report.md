@@ -356,3 +356,19 @@ QA v2 报告发出后，Lead 修掉了其中唯一新增的 P2，并做了完整
 | #4 恰好 30 条时「加载更多」空按钮 | ⏸ 保留 | 多点一次即自动隐藏；彻底修需 `/api/state` 增加 hasMore 字段 |
 
 回归结果：`node --test` **234/234 PASS**；`node scripts/browser-e2e.mjs`（web + 跨源 + CLI）连跑 2 次均 **644/644 断言 PASS，exit 0**；`docs/screenshots/` 已随最新代码重新生成。
+
+---
+
+## 10. 多端实时同步（SSE）与刷新按钮 — 后续验证记录
+
+**需求**：多人同时使用后，需要看到别人刚记录的数据；用户先要求「刷新按钮」，并提出可用长连接/WebSocket。
+
+**方案（Lead 实现）**：SSE（Server-Sent Events，浏览器原生 `EventSource`，零依赖）为主 + 手动刷新按钮兜底：
+- 服务端 `GET /api/events/stream`：SSE hub、`retry: 3000`、25s 心跳、记录增删即广播（`{type:"feed"|"diaper",event}` / `{type:"delete",id}`）、跨源 CORS、关闭应用时主动结束连接。
+- 前端：顶栏刷新按钮（44×44，转圈/禁用/toast「已刷新最新数据」）；`EventSource` 订阅并**幂等应用**变更（避免本人 POST 响应与 SSE 回声乱序导致重复计数）；收到他人新增提示「已同步 …」（不打断撤销 toast）；断线重连后静默全量校准；`visibilitychange` 回前台静默校准；不支持 EventSource 时降级 30s 轮询。
+
+**验证**：
+- `node --test` → **241/241 PASS**（新增 `test/sse.test.js` 7 项：响应头/CORS/初始帧、喂奶/大小便/删除广播、多客户端、心跳、关闭连接、同毫秒多次记录）。
+- `scripts/browser-e2e.mjs` 连跑 2 次 → **644/644 PASS**（回归无破坏；`docs/screenshots/` 已更新为带刷新按钮的新 UI）。
+- **真实浏览器 + 第二客户端**（curl/API 直接模拟另一台设备）21/21 PASS：写入后页面 Hero 倒计时/标签标题/今日汇总/时间线**无需刷新**即更新并提示「已同步」；第二端删除后记录实时消失、Hero 恢复；刷新按钮转圈→toast→恢复可用；320px 无横向滚动、刷新按钮点击区 44px；console 无错误。
+- 过程中发现并修复真实竞态：POST 响应与 SSE 回声可能先到/后到导致同一条记录被应用两次（e2e 实测汇总 420 ml ≠ 300 ml、撤销后时间线多一条），已把应用逻辑改为幂等并回归通过。

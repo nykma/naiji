@@ -31,30 +31,54 @@
             <span class="brand-sub">婴儿喂养记录</span>
           </span>
         </div>
-        <a
-          class="export-link"
-          id="exportCsv"
-          data-testid="export-csv"
-          href="/api/export.csv"
-          download
-          aria-label="导出 CSV"
-        >
-          <svg
-            class="export-icon"
-            viewBox="0 0 24 24"
-            fill="none"
-            stroke="currentColor"
-            stroke-width="2"
-            stroke-linecap="round"
-            stroke-linejoin="round"
-            aria-hidden="true"
+        <div class="topbar-actions">
+          <button
+            type="button"
+            class="refresh-btn"
+            id="refreshBtn"
+            data-testid="refresh"
+            aria-label="刷新最新数据"
+            title="刷新最新数据"
           >
-            <path d="M12 4v11" />
-            <path d="m7.5 10.5 4.5 4.5 4.5-4.5" />
-            <path d="M5 19.5h14" />
-          </svg>
-          <span>导出 CSV</span>
-        </a>
+            <svg
+              class="refresh-icon"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="2"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+              aria-hidden="true"
+            >
+              <path d="M20.5 15a9 9 0 1 1-2.6-8.9" />
+              <path d="M21 4v5h-5" />
+            </svg>
+          </button>
+          <a
+            class="export-link"
+            id="exportCsv"
+            data-testid="export-csv"
+            href="/api/export.csv"
+            download
+            aria-label="导出 CSV"
+          >
+            <svg
+              class="export-icon"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="2"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+              aria-hidden="true"
+            >
+              <path d="M12 4v11" />
+              <path d="m7.5 10.5 4.5 4.5 4.5-4.5" />
+              <path d="M5 19.5h14" />
+            </svg>
+            <span>导出 CSV</span>
+          </a>
+        </div>
       </header>
 
       <main class="main">

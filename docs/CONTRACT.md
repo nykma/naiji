@@ -12,6 +12,7 @@
 2. **喂奶类型多选**：一次喂奶可同时勾选多个标签（奶粉 / 母乳·瓶喂 / 亲喂），**只记一个总奶量**，例如「奶粉 + 母乳 120 ml」「亲喂 + 奶粉 60 ml」。
 3. 数据模型与 API 相应调整（`feedType` → `feedTypes` 数组），**旧库自动迁移，数据不丢**。
 4. 新增 CORS 支持，允许 web 与 server 不同源部署。
+5. **多端实时同步**：新增 SSE 端点 `GET /api/events/stream`，任何一端记录/删除后实时推送给所有打开的页面；顶栏提供手动「刷新」按钮，回到页面时也会静默校准。零依赖（浏览器原生 `EventSource`）。
 
 ## 1. 技术栈与硬约束
 
@@ -182,6 +183,37 @@ diaper：`feedTypes: null, amountMl: null, diaperKind: "pee"`。
 
 `200 text/csv; charset=utf-8`，UTF-8 BOM，`Content-Disposition: attachment; filename="baby-milk-YYYY-MM-DD.csv"`，按 `happenedAt ASC`。表头 `时间,类别,项目,奶量(ml),备注`：喂奶「项目」= 标签中文以 ` + ` 连接（如 `奶粉 + 母乳（瓶喂）`）；大小便为 `小便`/`大便`/`大小便`；奶量为总奶量或空。
 
+### GET /api/events/stream（SSE 多端实时同步）
+
+长连接事件流，`Content-Type: text/event-stream; charset=utf-8`、`Cache-Control: no-cache, no-transform`、`X-Accel-Buffering: no`（跨源时带常规 CORS 头）。连接建立后立即收到：
+
+```
+retry: 3000
+: connected
+```
+
+之后服务端在**任何客户端**新增/删除记录时向所有连接广播（`event: change`）：
+
+```
+event: change
+data: {"type":"feed","event":{...完整 Event...}}
+```
+
+```
+event: change
+data: {"type":"diaper","event":{...}}
+```
+
+```
+event: change
+data: {"type":"delete","id":12}
+```
+
+- 心跳：默认每 25 秒发送注释帧 `: ping`（`createApp({ sseHeartbeatMs })` 可调，测试用）。
+- 浏览器 `EventSource` 会按 `retry` 自动重连；服务端关闭时会主动结束所有连接。
+- web 端行为：收到 `change` → 幂等应用（同一 id 只应用一次，避免与本人 POST 响应竞态重复计数）；`delete` → 从本地移除；断线重连成功后静默全量校准一次。
+- CLI 不强制订阅；CLI 每次命令本来就直接读服务端，天然一致。
+
 ### 静态文件
 
 `SERVE_WEB=1` 时：`GET /` → `web/index.html`，其余按 `web/` 路径返回；`Cache-Control: no-cache`、`X-Content-Type-Options: nosniff`；HTML 带 CSP（`default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; script-src 'self'; manifest-src 'self'; connect-src *`，其中 `connect-src *` 是为了跨源访问独立部署的 API）；防目录穿越。`SERVE_WEB=0` 时静态请求返回 404 JSON，提示 web 需独立托管。
@@ -213,6 +245,12 @@ diaper：`feedTypes: null, amountMl: null, diaperKind: "pee"`。
 - 同时选中亲喂 + 瓶喂标签时：仍显示奶量面板，并给一行小提示「奶量填写本次补充的瓶喂量」。
 - 时间线/今日汇总：标题用 `eventTitle(event)`（如「奶粉 + 母乳（瓶喂） 120 ml」）；今日汇总格式「喂奶 N 次 · 奶量 M ml · 亲喂 K 次 · 小便 X · 大便 Y」。
 - **浏览器标签标题（document.title）**：有上次喂奶时显示 `距上次 X 小时 X 分钟 · 奶记`（用 `formatDuration`，与 Hero 同源、随 Hero 每秒刷新；不足 1 分钟时显示 `刚刚喂过 · 奶记`）；没有记录/未加载时为 `奶记 · 婴儿喂养记录`。用于切到其他标签页时瞥一眼间隔。
+- **多端实时同步 + 手动刷新**：
+  - 顶栏「刷新」按钮（`data-testid="refresh"`，44×44、`aria-label="刷新最新数据"`）：点击 → `GET /api/state` 拉取最新数据，以服务端为准重置时间线（回到最近 30 条）与聚合；刷新中按钮禁用+转圈，完成后 toast「已刷新最新数据」，失败显示后端消息。写操作进行中不触发，避免与 POST 竞态。
+  - `EventSource` 订阅 `apiUrl('/api/events/stream')`：收到新增 → 幂等插入时间线、更新 Hero/今日汇总，并 toast「已同步 xxx」（本人操作的回声跳过；若当前有可撤销 toast 则不打断）；收到删除 → 从本地移除；opened 后断线重连成功 → 静默全量校准。
+  - 页面 `visibilitychange` 回到前台时静默校准一次（覆盖「切走期间别人记录」的场景）。
+  - 不支持 `EventSource` 的浏览器降级为每 30 秒静默轮询。
+  - 其他端记录后，Hero 倒计时/标签标题/今日汇总/时间线均无需刷新即更新；手动刷新用于兜底和手动确认。
 - 其余（Hero 实时「距离上次喂奶 X 小时 X 分钟」、撤销 toast、时间线按天分组、加载更多、删除确认、加载失败重试、深色模式、PWA、`data-testid` 集合）与 v1 相同，不得回退。
 
 ### 6.3 web/lib/format.js（浏览器 + tests 共用，测试依赖）
@@ -283,7 +321,9 @@ diaper：`feedTypes: null, amountMl: null, diaperKind: "pee"`。
 
 - `npm test`（`node --test` 自动发现 `test/**`、`cli/test/**`）全绿，用临时数据库，不污染 `data/`。
 - `test/`（tests teammate）覆盖：v1→v2 迁移、多标签校验、state 聚合（feedCount/totalMl/各标签 count/mixedFeedCount）、CORS/OPTIONS、`SERVE_WEB=0`、CSV 多标签项目名、分页、静态度量等。
+- `test/sse.test.js` 覆盖：SSE 响应头/CORS/初始帧、新增喂奶/大小便广播、删除广播、多客户端同时收到、心跳帧、关闭应用结束连接。
 - `scripts/browser-e2e.mjs`（QA）覆盖 v2 前端：多选类型 → 一键记录 → toast/Hero/汇总/时间线；撤消；删除；深色/窄屏/无横向滚动；console/网络无异常；截图更新到 `docs/screenshots/`。
+- 多端同步验收（真实浏览器 + 第二客户端直接调 API）：页面无需刷新即更新 Hero/标签标题/今日汇总/时间线；其他端删除后记录实时消失；刷新按钮转圈/toast/恢复可用；320px 无横向滚动、刷新按钮点击区 ≥44px、console 无错误。
 - QA 还要做 **CLI 端到端**：真实启动 server + 临时 DB，spawn CLI 执行 `status/feed/pee/log/undo/export`，断言输出与服务端数据一致。
 - QA 还要验证**前后端分离**：用 `scripts/serve-web.mjs` 在另一个端口托管 `web/`，把 `config.js` 的 `apiBase`（或 `?api=`）指向 API 端口，确认页面跨源正常记录（依赖 server CORS）。
 - 验收结论写入 `docs/qa-report.md`（v2，P0/P1/P2 + 截图 + CLI 证据）。

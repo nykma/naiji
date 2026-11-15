@@ -109,10 +109,19 @@ docker compose start
 server {
   listen 80;
   root /usr/share/nginx/html;          # 放 web/ 的内容
-  location / { try_files $uri $uri/ /index.html; }
-  location /api/ { proxy_pass http://naiji:3000; }
+  location / { try_files $uri $uri/ /index.html; }   # /config.js 的 apiBase 可留空
+  location /api/ {
+    proxy_pass http://naiji:3000;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    # 多端实时同步走 SSE 长连接：必须关闭缓冲，否则推送会被 nginx 攒着
+    proxy_buffering off;
+    proxy_read_timeout 3600s;
+  }
 }
 ```
+
+> 服务端响应已带 `X-Accel-Buffering: no`，nginx 默认会尊重它；上面显式写 `proxy_buffering off` 更稳。若用 Caddy/Traefik 等反代，同样确保不缓冲 `text/event-stream`。
 
 ---
 
