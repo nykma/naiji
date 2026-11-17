@@ -134,7 +134,7 @@ export function diaperKindLabel(diaperKind) {
   return DIAPER_KIND_LABELS[diaperKind] ?? '大小便';
 }
 
-/** 事件标题：喂奶 → "奶粉 + 母乳（瓶喂） 120 ml" / "亲喂"；大小便 → "小便" */
+/** 事件标题：喂奶 → "奶粉 + 母乳（瓶喂） 120 ml" / "亲喂"；大小便 → "小便"；洗澡 → "洗澡" */
 export function eventTitle(event) {
   if (!event) return '';
   if (event.kind === 'feed') {
@@ -147,10 +147,11 @@ export function eventTitle(event) {
     const amount = formatAmount(event.amountMl);
     return amount ? `${label} ${amount}` : label;
   }
+  if (event.kind === 'bath') return '洗澡';
   return diaperKindLabel(event.diaperKind);
 }
 
-/** 事件图标：含 formula → 🍼；否则含 breast_milk → 🥛；否则 🤱；大小便 💧/💩/🚼 */
+/** 事件图标：含 formula → 🍼；否则含 breast_milk → 🥛；否则 🤱；大小便 💧/💩/🚼；洗澡 🛁 */
 export function eventIcon(event) {
   if (!event) return '';
   if (event.kind === 'feed') {
@@ -163,6 +164,7 @@ export function eventIcon(event) {
     if (types.includes('breast_milk')) return '🥛';
     return '🤱';
   }
+  if (event.kind === 'bath') return '🛁';
   if (event.diaperKind === 'pee') return '💧';
   if (event.diaperKind === 'poop') return '💩';
   return '🚼';
@@ -170,7 +172,7 @@ export function eventIcon(event) {
 
 /**
  * 今日汇总行（status / today 共用）：
- * 「今日 喂奶 N 次 · 奶量 M ml · 亲喂 K 次 · 小便 X · 大便 Y」
+ * 「今日 喂奶 N 次 · 奶量 M ml · 亲喂 K 次 · 小便 X · 大便 Y · 洗澡 Z 次」
  */
 export function formatTodaySummary(today = {}) {
   const feedCount = Number(today?.feedCount ?? 0);
@@ -178,7 +180,8 @@ export function formatTodaySummary(today = {}) {
   const breastDirectCount = Number(today?.breastDirectCount ?? 0);
   const peeCount = Number(today?.peeCount ?? 0);
   const poopCount = Number(today?.poopCount ?? 0);
-  return `今日 喂奶 ${feedCount} 次 · 奶量 ${totalMl} ml · 亲喂 ${breastDirectCount} 次 · 小便 ${peeCount} · 大便 ${poopCount}`;
+  const bathCount = Number(today?.bathCount ?? 0);
+  return `今日 喂奶 ${feedCount} 次 · 奶量 ${totalMl} ml · 亲喂 ${breastDirectCount} 次 · 小便 ${peeCount} · 大便 ${poopCount} · 洗澡 ${bathCount} 次`;
 }
 
 /** 字节数 → 可读文案 */

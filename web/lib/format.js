@@ -1,11 +1,12 @@
 /**
- * 奶记 · 共享格式化工具（纯函数，v2）
+ * 奶记 · 共享格式化工具（纯函数，v3）
  *
  * 浏览器（web/index.html 经 app.js import）与 Node 测试（test/*.test.js）共用。
  * 约定：所有时间戳为 epoch 毫秒；日期/时钟展示一律使用**运行环境的本地时区**。
  * 本文件不要依赖 DOM、fetch、process 等环境 API。
  *
  * v2 变更：喂奶类型由单值改为多标签数组（feedTypes），并新增 feedTypesLabel()。
+ * v3 变更：新增洗澡事件（kind === 'bath'）的标题与图标。
  * 规范顺序：formula → breast_milk → breast_direct。
  */
 
@@ -131,6 +132,7 @@ function eventFeedTypes(event) {
  * - 喂奶有奶量 → "奶粉 + 母乳（瓶喂） 120 ml"
  * - 喂奶无奶量 → 标签文案（"亲喂"）
  * - 大小便 → 小便 / 大便 / 大小便
+ * - 洗澡 → 洗澡（v3）
  */
 export function eventTitle(event) {
   if (!event) return '';
@@ -140,11 +142,13 @@ export function eventTitle(event) {
     if (amount) return label ? `${label} ${amount}` : amount;
     return label || '喂奶';
   }
+  if (event.kind === 'bath') return '洗澡';
   return diaperKindLabel(event.diaperKind);
 }
 
 /**
- * 事件图标 emoji：含 formula → 🍼；否则含 breast_milk → 🥛；否则 🤱；大小便同 v1。
+ * 事件图标 emoji：含 formula → 🍼；否则含 breast_milk → 🥛；否则 🤱；
+ * 大小便同 v1；洗澡 → 🛁（v3）。
  */
 export function eventIcon(event) {
   if (!event) return '';
@@ -154,6 +158,7 @@ export function eventIcon(event) {
     if (types.includes('breast_milk')) return '🥛';
     return '🤱';
   }
+  if (event.kind === 'bath') return '🛁';
   if (event.diaperKind === 'pee') return '💧';
   if (event.diaperKind === 'poop') return '💩';
   return '🚼';

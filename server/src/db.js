@@ -1,8 +1,9 @@
 /**
  * 奶记 · SQLite 数据层（node:sqlite，零依赖）
  *
- * schema v2：单表 events；喂奶类型存 feed_types JSON 数组（多选标签），
- * 奶量为「本次喂奶总奶量」。v1（单值 feed_type 列）会在打开时自动迁移。
+ * schema v3：单表 events，kind 支持 feed / diaper / bath；
+ * 喂奶类型存 feed_types JSON 数组（多选标签），奶量为「本次喂奶总奶量」。
+ * 打开旧库时自动迁移：v1（单值 feed_type 列）→ v3，v2（kind 仅 feed/diaper）→ v3。
  * 详见 docs/CONTRACT.md。
  */
 
@@ -12,12 +13,12 @@ import path from 'node:path';
 
 import { sortFeedTypes } from './feed-types.js';
 
-export const SCHEMA_VERSION = 2;
+export const SCHEMA_VERSION = 3;
 
-const EVENTS_TABLE_V2 = `
+const EVENTS_TABLE_V3 = `
 CREATE TABLE IF NOT EXISTS events (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
-  kind        TEXT    NOT NULL CHECK (kind IN ('feed', 'diaper')),
+  kind        TEXT    NOT NULL CHECK (kind IN ('feed', 'diaper', 'bath')),
   feed_types  TEXT,
   amount_ml   INTEGER CHECK (amount_ml IS NULL OR (amount_ml >= 1 AND amount_ml <= 2000)),
   diaper_kind TEXT    CHECK (diaper_kind IN ('pee', 'poop', 'mixed')),
@@ -28,6 +29,8 @@ CREATE TABLE IF NOT EXISTS events (
     (kind = 'feed' AND feed_types IS NOT NULL AND diaper_kind IS NULL)
     OR
     (kind = 'diaper' AND feed_types IS NULL AND amount_ml IS NULL AND diaper_kind IS NOT NULL)
+    OR
+    (kind = 'bath' AND feed_types IS NULL AND amount_ml IS NULL AND diaper_kind IS NULL)
   )
 );
 `;
@@ -52,47 +55,29 @@ function getUserVersion(db) {
   return Number(row?.user_version ?? 0);
 }
 
-/**
- * 建表 / 迁移到 v2。迁移是事务内幂等的：v1 的 feed_type 单值 → feed_types JSON 数组。
- */
-function ensureSchema(db) {
-  const version = getUserVersion(db);
-  if (version >= SCHEMA_VERSION && tableExists(db, 'events') && tableInfo(db, 'events').includes('feed_types')) {
-    db.exec(EVENTS_INDEXES);
-    return;
-  }
-
-  if (!tableExists(db, 'events')) {
-    db.exec('BEGIN');
-    try {
-      db.exec(EVENTS_TABLE_V2);
-      db.exec(EVENTS_INDEXES);
-      db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
-      db.exec('COMMIT');
-    } catch (error) {
-      db.exec('ROLLBACK');
-      throw error;
-    }
-    return;
-  }
-
-  const columns = tableInfo(db, 'events');
-  if (columns.includes('feed_types')) {
-    // 已经是 v2 结构，只补版本号与索引
-    db.exec(EVENTS_INDEXES);
+/** 事务内执行迁移步骤 */
+function runInTransaction(db, step) {
+  db.exec('BEGIN');
+  try {
+    step();
     db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
-    return;
+    db.exec('COMMIT');
+  } catch (error) {
+    db.exec('ROLLBACK');
+    throw error;
   }
+}
 
-  // ---- v1 → v2 迁移 ----
+/** v1：单值 feed_type 列 → v3（feed_types JSON 数组 + 支持 bath） */
+function migrateFromV1(db) {
+  const columns = tableInfo(db, 'events');
   if (!columns.includes('feed_type')) {
     throw new Error('无法识别的 events 表结构（缺少 feed_type / feed_types 列），拒绝迁移');
   }
 
-  db.exec('BEGIN');
-  try {
+  runInTransaction(db, () => {
     db.exec('ALTER TABLE events RENAME TO events_v1_backup');
-    db.exec(EVENTS_TABLE_V2);
+    db.exec(EVENTS_TABLE_V3);
 
     // 大小便记录直接搬
     db.exec(`
@@ -121,12 +106,55 @@ function ensureSchema(db) {
 
     db.exec('DROP TABLE events_v1_backup');
     db.exec(EVENTS_INDEXES);
-    db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
-    db.exec('COMMIT');
-  } catch (error) {
-    db.exec('ROLLBACK');
-    throw error;
+  });
+}
+
+/** v2：kind 仅允许 feed/diaper，需要重建表以放宽 CHECK（新增 bath），结构不变、数据原样搬 */
+function migrateFromV2(db) {
+  runInTransaction(db, () => {
+    db.exec('ALTER TABLE events RENAME TO events_v2_backup');
+    db.exec(EVENTS_TABLE_V3);
+    db.exec(`
+      INSERT INTO events (id, kind, feed_types, amount_ml, diaper_kind, note, happened_at, created_at)
+      SELECT id, kind, feed_types, amount_ml, diaper_kind, note, happened_at, created_at
+      FROM events_v2_backup
+    `);
+    db.exec('DROP TABLE events_v2_backup');
+    db.exec(EVENTS_INDEXES);
+  });
+}
+
+/**
+ * 建表 / 迁移到 v3。迁移均在事务内完成，重复打开幂等：
+ * - 无表 → 建 v3
+ * - v1（无 feed_types 列）→ v3
+ * - v2（有 feed_types 列但版本 < 3）→ 重建表放宽 kind CHECK
+ */
+function ensureSchema(db) {
+  const version = getUserVersion(db);
+  const hasEvents = tableExists(db, 'events');
+
+  if (!hasEvents) {
+    runInTransaction(db, () => {
+      db.exec(EVENTS_TABLE_V3);
+      db.exec(EVENTS_INDEXES);
+    });
+    return;
   }
+
+  const columns = tableInfo(db, 'events');
+  if (!columns.includes('feed_types')) {
+    migrateFromV1(db);
+    return;
+  }
+
+  if (version < SCHEMA_VERSION) {
+    migrateFromV2(db);
+    return;
+  }
+
+  // 已经是 v3：只补索引
+  db.exec(EVENTS_INDEXES);
 }
 
 function parseFeedTypes(raw) {
@@ -178,18 +206,20 @@ export class Store {
   }
 
   /**
-   * 底层创建事件：feed 传 feedTypes/amountMl，diaper 传 diaperKind。
-   * @param {{ kind: 'feed'|'diaper', feedTypes?: string[]|null, amountMl?: number|null,
+   * 底层创建事件：feed 传 feedTypes/amountMl，diaper 传 diaperKind，bath 两者都不传。
+   * @param {{ kind: 'feed'|'diaper'|'bath', feedTypes?: string[]|null, amountMl?: number|null,
    *           diaperKind?: string|null, note?: string|null, happenedAt: number, createdAt?: number }} input
    */
   createEvent(input) {
     const isFeed = input.kind === 'feed';
+    const isDiaper = input.kind === 'diaper';
+    const kind = isFeed ? 'feed' : isDiaper ? 'diaper' : 'bath';
     const types = isFeed ? sortFeedTypes(input.feedTypes ?? []) : null;
     const info = this.stmts.insert.run(
-      isFeed ? 'feed' : 'diaper',
+      kind,
       isFeed ? JSON.stringify(types) : null,
       isFeed ? (input.amountMl ?? null) : null,
-      isFeed ? null : (input.diaperKind ?? null),
+      isDiaper ? (input.diaperKind ?? null) : null,
       input.note ?? null,
       input.happenedAt,
       input.createdAt ?? Date.now(),
@@ -205,6 +235,11 @@ export class Store {
   /** 记录一次大小便 */
   createDiaperEvent({ diaperKind, note = null, happenedAt, createdAt }) {
     return this.createEvent({ kind: 'diaper', feedTypes: null, amountMl: null, diaperKind, note, happenedAt, createdAt });
+  }
+
+  /** 记录一次洗澡（无奶量/无大小便类型） */
+  createBathEvent({ note = null, happenedAt, createdAt }) {
+    return this.createEvent({ kind: 'bath', feedTypes: null, amountMl: null, diaperKind: null, note, happenedAt, createdAt });
   }
 
   getEvent(id) {

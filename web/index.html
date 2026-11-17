@@ -189,12 +189,104 @@
               <span class="diaper-emoji" aria-hidden="true">💩</span>
               <span class="diaper-label">大便</span>
             </button>
+            <button type="button" class="diaper-btn diaper-btn--bath record-btn" data-testid="record-bath">
+              <span class="diaper-emoji" aria-hidden="true">🛁</span>
+              <span class="diaper-label">洗澡</span>
+            </button>
           </div>
         </section>
 
         <section class="card summary" aria-labelledby="summaryTitle">
           <h2 class="summary-title" id="summaryTitle">今日汇总</h2>
           <p class="summary-line" data-testid="today-summary">正在加载…</p>
+        </section>
+
+        <section class="card stats" id="statsCard" data-testid="stats-card" aria-labelledby="statsTitle">
+          <div class="card-head stats-head">
+            <h2 class="card-title" id="statsTitle">趋势</h2>
+            <div class="stats-range" role="group" aria-label="统计范围">
+              <button
+                type="button"
+                class="stats-range-btn"
+                data-testid="stats-range-7"
+                data-range="7"
+                aria-pressed="true"
+              >
+                7 天
+              </button>
+              <button
+                type="button"
+                class="stats-range-btn"
+                data-testid="stats-range-30"
+                data-range="30"
+                aria-pressed="false"
+              >
+                30 天
+              </button>
+            </div>
+          </div>
+
+          <div class="stats-metrics" role="group" aria-label="统计指标">
+            <button
+              type="button"
+              class="stats-metric"
+              data-testid="stats-metric-totalMl"
+              data-metric="totalMl"
+              aria-pressed="true"
+            >
+              奶量 ml
+            </button>
+            <button
+              type="button"
+              class="stats-metric"
+              data-testid="stats-metric-feedCount"
+              data-metric="feedCount"
+              aria-pressed="false"
+            >
+              喂奶次数
+            </button>
+            <button
+              type="button"
+              class="stats-metric"
+              data-testid="stats-metric-breastDirectCount"
+              data-metric="breastDirectCount"
+              aria-pressed="false"
+            >
+              亲喂
+            </button>
+            <button
+              type="button"
+              class="stats-metric"
+              data-testid="stats-metric-peeCount"
+              data-metric="peeCount"
+              aria-pressed="false"
+            >
+              小便
+            </button>
+            <button
+              type="button"
+              class="stats-metric"
+              data-testid="stats-metric-poopCount"
+              data-metric="poopCount"
+              aria-pressed="false"
+            >
+              大便
+            </button>
+            <button
+              type="button"
+              class="stats-metric"
+              data-testid="stats-metric-bathCount"
+              data-metric="bathCount"
+              aria-pressed="false"
+            >
+              洗澡
+            </button>
+          </div>
+
+          <div class="stats-chart" data-testid="stats-chart" role="img" aria-label="最近 7 天奶量趋势">
+            <p class="stats-chart-note">正在加载趋势…</p>
+          </div>
+          <p class="stats-summary" data-testid="stats-summary">正在加载…</p>
         </section>
 
         <section class="card timeline-card" aria-labelledby="timelineTitle">

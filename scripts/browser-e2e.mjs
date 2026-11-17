@@ -1,24 +1,32 @@
 #!/usr/bin/env node
 /**
- * 奶记 · 婴儿喂养记录 — v2 独立 QA 端到端脚本（零第三方依赖）
+ * 奶记 · 婴儿喂养记录 — v3 独立 QA 端到端脚本（零第三方依赖）
  *
- * 真正拉起 v2 的三个部分：
+ * 真正拉起 v3 的三个部分：
  *   1. 用真实 CLI 启动 `node server/src/server.js`（随机空闲端口 + 临时目录 SQLite）；
  *   2. 用 `node scripts/serve-web.mjs` 在另一个随机端口独立托管 web/，验证前后端分离 + CORS；
- *   3. spawn `cli/bin/naiji` 的端到端用例（status/feed/pee/log/today/undo/rm/export/config/错误退出码）；
+ *   3. spawn `cli/bin/naiji` 的端到端用例（status/feed/pee/poop/bath/log/today/undo/rm/export/config/错误退出码）；
  *   4. 启动系统 headless Chrome，用 Node 内置 WebSocket 走 Chrome DevTools Protocol 驱动真实页面：
  *      真实鼠标点击、真实键盘输入、真实确认弹窗、真实网络请求（含跨源预检 OPTIONS）；
  *   5. 断言 → 截图到 docs/screenshots/ → 清理 Chrome / 服务 / 临时目录；
  *   6. 全部通过 exit 0，有失败 exit 1。可重复执行（每次独立 DB / 端口 / 浏览器 profile）。
  *
+ * v3 新增分组：
+ *   - G06b 洗澡：一键记录 / toast / 时间线 / 今日汇总 / Hero「距上次换尿布/洗澡」重置 / 撤销 / 持久化 / SSE 他人记录；
+ *   - G16b v3 契约：POST /api/baths 校验、state.lastBath/today.bathCount、/api/stats 形状与非法参数、CSV 洗澡行、v2→v3 迁移；
+ *   - G18b 趋势卡：7/30 天切换、6 指标切换、数据点/汇总与 GET /api/stats 一致、空状态、320/390/900 无横向滚动、深色模式；
+ *   - G17 补充 CLI 洗澡（bath/b/--note/--ago/--json/undo）、status/today/log 洗澡文案。
+ *
  * 用法：
  *   node scripts/browser-e2e.mjs
  *   KEEP_ARTIFACTS=1 node scripts/browser-e2e.mjs   # 保留临时目录（调试用）
+ *   E2E_MANIFEST=1 node scripts/browser-e2e.mjs     # 额外打印逐条断言清单（用于两次运行 diff）
  *
- * 覆盖 docs/CONTRACT.md v2 §5/§6/§7/§8；本脚本只读产品代码，不修改 server/ web/ cli/ test/。
+ * 覆盖 docs/CONTRACT.md v3 §4/§5/§6.4/§7/§8；本脚本只读产品代码，不修改 server/ web/ cli/ test/。
  */
 
 import { spawn } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { access, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import net from 'node:net';
 import os from 'node:os';
@@ -48,8 +56,21 @@ const VIEWPORT_NARROW = { width: 320, height: 640, dsf: 2, mobile: true };
 const VIEWPORT_DESKTOP = { width: 900, height: 900, dsf: 2, mobile: false };
 
 const GAP_FORMAT_RE = /^(刚刚|\d+ 分钟|\d+ 小时( \d+ 分钟)?|\d+ 天( \d+ 小时)?)$/;
+/** Hero 第三行 v3 文案「距上次换尿布/洗澡 X」的时长部分 */
+const CLEANING_GAP_RE = /^距上次换尿布\/洗澡 (刚刚|\d+ 分钟|\d+ 小时( \d+ 分钟)?|\d+ 天( \d+ 小时)?)$/;
 const FEED_LABELS = { formula: '奶粉', breast_milk: '母乳（瓶喂）', breast_direct: '亲喂' };
 const DIAPER_LABELS = { pee: '小便', poop: '大便', mixed: '大小便' };
+
+/** v3 趋势卡 6 个指标（与 web/app.js 的 STATS_METRICS 一致，仅用于断言） */
+const STATS_METRICS = [
+  { key: 'totalMl', label: '奶量', unit: 'ml' },
+  { key: 'feedCount', label: '喂奶次数', unit: '次' },
+  { key: 'breastDirectCount', label: '亲喂', unit: '次' },
+  { key: 'peeCount', label: '小便', unit: '次' },
+  { key: 'poopCount', label: '大便', unit: '次' },
+  { key: 'bathCount', label: '洗澡', unit: '次' },
+];
+const STATS_X_LABEL_EVERY = 5; // 30 天视图每 5 天一个 X 标签
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -819,6 +840,26 @@ class PageClient {
         clip: { x: 0, y: 0, width, height, scale: 1 },
       };
     }
+    return this._capture(name, params, { fullPage });
+  }
+
+  /** 不重置滚动位置，直接截当前视口（v3 趋势卡 / 洗澡记录后的页面用） */
+  async screenshotViewport(name) {
+    return this._capture(name, { format: 'png', fromSurface: true }, { fullPage: false });
+  }
+
+  /** 把目标元素滚到视口中央后截当前视口（元素级证据截图） */
+  async screenshotOf(selector, name, { block = 'center' } = {}) {
+    await this.evaluate(
+      `(() => { const el = document.querySelector(${jsString(selector)}); if (el) el.scrollIntoView({ block: ${jsString(
+        block,
+      )}, inline: 'center' }); })()`,
+    );
+    await sleep(260);
+    return this.screenshotViewport(name);
+  }
+
+  async _capture(name, params, { fullPage }) {
     const result = await this.cdp.send('Page.captureScreenshot', params, 30_000);
     const buffer = Buffer.from(result.data, 'base64');
     const file = path.join(SHOT_DIR, name);
@@ -872,6 +913,18 @@ class ApiClient {
 
   createDiaper(payload) {
     return this.request('/api/diapers', { method: 'POST', json: payload });
+  }
+
+  createBath(payload = {}) {
+    return this.request('/api/baths', { method: 'POST', json: payload });
+  }
+
+  async stats(days, tzOffset) {
+    const params = new URLSearchParams();
+    if (days !== undefined && days !== null) params.set('days', String(days));
+    if (tzOffset !== undefined && tzOffset !== null) params.set('tzOffset', String(tzOffset));
+    const query = params.toString();
+    return this.request(`/api/stats${query ? `?${query}` : ''}`);
   }
 
   async state(tzOffset) {
@@ -932,7 +985,7 @@ function feedTypesLabelNode(types) {
     .join(' + ');
 }
 
-/** 事件标题（v2）：有奶量 → "奶粉 + 母乳（瓶喂） 120 ml"；仅亲喂 → "亲喂" */
+/** 事件标题（v3）：有奶量 → "奶粉 + 母乳（瓶喂） 120 ml"；仅亲喂 → "亲喂" */
 function eventTitleNode(event) {
   if (!event) return '';
   if (event.kind === 'feed') {
@@ -945,6 +998,7 @@ function eventTitleNode(event) {
     if (event.amountMl === null || event.amountMl === undefined) return label || '喂奶';
     return label ? `${label} ${event.amountMl} ml` : `${event.amountMl} ml`;
   }
+  if (event.kind === 'bath') return '洗澡';
   return DIAPER_LABELS[event.diaperKind] ?? '大小便';
 }
 
@@ -954,6 +1008,105 @@ function formatDayKeyNode(ts) {
   const pad = (n) => (n < 10 ? `0${n}` : String(n));
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
 }
+
+/* ---------- v3：趋势卡断言辅助（与 web/app.js 的纯函数口径保持一致） ---------- */
+
+/** daily 里某指标的数值序列：非正 / 非法补 0（对应 web/app.js statsValues） */
+function statsValuesNode(daily, metricKey) {
+  return daily.map((item) => {
+    const value = Number(item && item[metricKey]);
+    return Number.isFinite(value) && value > 0 ? value : 0;
+  });
+}
+
+/** 日均格式化（对应 web/app.js formatAverage：最多 1 位小数，整数不带 .0） */
+function formatAverageNode(value) {
+  const rounded = Math.round(value * 10) / 10;
+  return Number.isInteger(rounded) ? String(rounded) : rounded.toFixed(1);
+}
+
+/** 汇总行期望文本：「N 天合计 X · 日均 Y · 最高 M（MM-DD）」（对应 renderStatsSummary） */
+function statsSummaryExpectedNode(daily, days, metric) {
+  const values = statsValuesNode(daily, metric.key);
+  const unit = metric.unit === 'ml' ? 'ml' : '次';
+  const total = values.reduce((sum, value) => sum + value, 0);
+  const max = values.length > 0 ? Math.max(...values) : 0;
+  const maxIndex = max > 0 ? values.indexOf(max) : values.length - 1;
+  const maxDay = daily[maxIndex];
+  const maxDate = maxDay && typeof maxDay.date === 'string' ? maxDay.date.slice(5) : '—';
+  const average = formatAverageNode(days > 0 ? total / days : 0);
+  return `${days} 天合计 ${total} ${unit} · 日均 ${average} ${unit} · 最高 ${max} ${unit}（${maxDate}）`;
+}
+
+/** 读取趋势卡 DOM 快照（数据点 / 折线段 / X 标签 / 数值标签 / 汇总 / 控件状态） */
+function pageStatsSnapshot() {
+  return page.evaluate(`(() => {
+    const chart = document.querySelector('[data-testid="stats-chart"]');
+    const svg = chart ? chart.querySelector('svg') : null;
+    const circles = svg ? [...svg.querySelectorAll('circle.stats-point')] : [];
+    const line = svg ? svg.querySelector('.stats-line') : null;
+    const d = line ? (line.getAttribute('d') || '') : '';
+    const rangeOf = (testid) => {
+      const el = document.querySelector('[data-testid="' + testid + '"]');
+      return el ? el.getAttribute('aria-pressed') : null;
+    };
+    return {
+      aria: chart ? chart.getAttribute('aria-label') : null,
+      role: chart ? chart.getAttribute('role') : null,
+      circles: circles.length,
+      lineSegments: (d.match(/[ML]/g) || []).length,
+      polyline: chart ? chart.querySelectorAll('polyline').length : 0,
+      gridLines: chart ? chart.querySelectorAll('.stats-grid-line').length : 0,
+      xLabels: chart ? [...chart.querySelectorAll('.stats-x-label')].map((el) => el.textContent) : [],
+      valueLabels: chart ? [...chart.querySelectorAll('.stats-value-label')].map((el) => el.textContent) : [],
+      emptyTexts: chart ? [...chart.querySelectorAll('.stats-empty-text')].map((el) => el.textContent) : [],
+      summary: document.querySelector('[data-testid="stats-summary"]')
+        ? document.querySelector('[data-testid="stats-summary"]').textContent
+        : null,
+      chartWidth: chart ? chart.clientWidth : 0,
+      svgWidth: svg ? Number(svg.getAttribute('width')) : 0,
+      range7: rangeOf('stats-range-7'),
+      range30: rangeOf('stats-range-30'),
+      metricsPressed: [...document.querySelectorAll('.stats-metric')]
+        .filter((el) => el.getAttribute('aria-pressed') === 'true')
+        .map((el) => el.dataset.metric),
+      xLabelCount: chart ? chart.querySelectorAll('.stats-x-label').length : 0,
+      gridLineCount: chart ? chart.querySelectorAll('.stats-grid-line').length : 0,
+      valueLabelCount: chart ? chart.querySelectorAll('.stats-value-label').length : 0,
+    };
+  })()`);
+}
+
+/** 等待趋势卡 SVG 数据点数量达到预期（范围切换 / 指标切换后重绘） */
+function waitStatsPoints(days, { timeout = 8000 } = {}) {
+  return page.waitForExpression(
+    `document.querySelectorAll('[data-testid="stats-chart"] circle.stats-point').length === ${Number(days)}`,
+    { timeout, interval: 120, desc: `趋势卡数据点 = ${days}` },
+  );
+}
+
+/** Node 侧 API 造一条洗澡记录 */
+function seedBath(happenedAt, note) {
+  const payload = {};
+  if (happenedAt !== undefined) payload.happenedAt = happenedAt;
+  if (note !== undefined) payload.note = note;
+  return api.createBath(payload);
+}
+
+/** 轮询 GET /api/state 直到条件满足（SSE 应用 / 撤销回调都是异步的） */
+async function waitApiState(predicate, { timeout = 8000, interval = 120, desc = 'API state 条件' } = {}) {
+  const started = Date.now();
+  let last = null;
+  while (Date.now() - started < timeout) {
+    last = await apiStateNow();
+    if (predicate(last)) return last;
+    await sleep(interval);
+  }
+  throw new Error(`等待超时 ${timeout}ms：${desc}（最后 state.today=${JSON.stringify(last?.today ?? null)}）`);
+}
+
+/** 找出页面浏览器标签标题（document.title） */
+const documentTitle = () => page.evaluate('document.title');
 
 function parseRgb(colorText) {
   const match = /rgba?\(([^)]+)\)/.exec(String(colorText ?? ''));
@@ -1052,7 +1205,7 @@ async function launchChrome(profileDir) {
 }
 
 /* ========================================================================== *
- * 8. 测试主体（v2：web 前端 + 前后端分离跨源 + CLI 端到端）
+ * 8. 测试主体（v3：web 前端 + 洗澡/趋势卡 + 前后端分离跨源 + CLI 端到端）
  * ========================================================================== */
 
 let tzOffset = 0; // 浏览器时区偏移，与 /api/state 对齐
@@ -1072,6 +1225,10 @@ const shotNames = [
   'empty-390.png',
   'multi-select-390.png',
   'cross-origin-390.png',
+  // v3 新增：趋势卡（含 30 天视图与深色）与洗澡记录后的页面
+  'stats-390.png',
+  'stats-dark-390.png',
+  'bath-390.png',
 ];
 
 /* ---------- 8.1 通用辅助：HTTP / 进程 / CLI ---------- */
@@ -1261,8 +1418,8 @@ async function main() {
   await ensureEnvironment();
   await mkdir(SHOT_DIR, { recursive: true });
 
-  tmpDir = await mkdtemp(path.join(os.tmpdir(), 'naiji-e2e-v2-'));
-  const dbPath = path.join(tmpDir, 'qa-v2.db');
+  tmpDir = await mkdtemp(path.join(os.tmpdir(), 'naiji-e2e-v3-'));
+  const dbPath = path.join(tmpDir, 'qa-v3.db');
   cliConfigDirPath = path.join(tmpDir, 'cli-config');
   const apiPort = await freePort();
   apiBase = `http://127.0.0.1:${apiPort}`;
@@ -1270,7 +1427,7 @@ async function main() {
 
   console.log('');
   console.log('══════════════════════════════════════════════════════════════');
-  console.log('  奶记 v2 · 独立 QA（web E2E + 跨源部署 + CLI 端到端）');
+  console.log('  奶记 v3 · 独立 QA（web E2E + 洗澡/趋势图 + 跨源部署 + CLI 端到端）');
   console.log('══════════════════════════════════════════════════════════════');
   console.log(`  Node      : ${process.version} (${NODE_BIN})`);
   console.log(`  项目根    : ${ROOT}`);
@@ -1350,6 +1507,22 @@ async function main() {
       const emptySummary = await page.textOfTestId('today-summary');
       assertIncludes(emptySummary, '喂奶 0 次', '空库今日汇总喂奶 0 次', `"${emptySummary}"`);
       assertIncludes(emptySummary, '奶量 0 ml', '空库今日汇总奶量 0 ml');
+      assertIncludes(emptySummary, '洗澡 0 次', '空库今日汇总含 v3 新增「洗澡 0 次」', `"${emptySummary}"`);
+      assertEqual(
+        await page.textOfTestId('gap-last-diaper'),
+        '还没有换尿布/洗澡记录',
+        '空库 Hero 第三行显示 v3 文案「还没有换尿布/洗澡记录」',
+      );
+      // v3 趋势卡首屏即存在（懒加载数据，但 DOM 结构必须就位）
+      assert(await page.isVisible(sel('stats-card')), 'v3 趋势卡 stats-card 首屏已渲染');
+      assertEqual(await page.attr(sel('stats-range-7'), 'aria-pressed'), 'true', '趋势卡默认选中「7 天」');
+      assertEqual(await page.attr(sel('stats-range-30'), 'aria-pressed'), 'false', '趋势卡「30 天」默认未选中');
+      assertEqual(await page.attr(sel('stats-metric-totalMl'), 'aria-pressed'), 'true', '趋势卡默认指标为「奶量 ml」');
+      const emptyChartText = await page.waitForText(sel('stats-chart'), '最近 7 天还没有数据', {
+        timeout: 8000,
+        desc: '空库趋势卡空状态',
+      });
+      assertIncludes(emptyChartText, '最近 7 天还没有数据', '空库趋势卡显示「最近 7 天还没有数据」', `"${emptyChartText}"`);
       assertEqual(await page.attr(sel('export-csv'), 'href'), '/api/export.csv', '同源模式下导出链接为相对 /api/export.csv');
 
       // 造一条 90 分钟前的多标签喂奶（奶粉 + 母乳瓶喂）
@@ -1677,6 +1850,159 @@ async function main() {
       await page.waitForResponse((r) => r.method === 'DELETE' && /^\/api\/events\/\d+$/.test(r.path), { since: deleteSince });
       await sleep(250);
       assertEqual((await api.allEvents()).length, beforeEvents, '撤销后事件数恢复（连点测试数据已清理）');
+    });
+
+    /* ------------------------------------------------ G06b 洗澡（v3 新增） */
+    await runGroup('G06b', '洗澡：一键记录 / toast / 时间线 / 汇总 / Hero 计时重置 / 撤销 / 持久化 / SSE', async () => {
+      // 结构：大小便卡片第三个按钮，文案「洗澡」，点击区 ≥ 44px
+      const bathButtonText = (await page.textOfTestId('record-bath')).trim();
+      assertIncludes(bathButtonText, '洗澡', '「记录大小便」卡片第三个按钮文案包含「洗澡」');
+      assertIncludes(bathButtonText, '🛁', '洗澡按钮带 🛁 图标');
+      const diaperButtons = await page.evaluate(
+        `[...document.querySelectorAll('.diaper-grid .diaper-btn')].map((el) => el.dataset.testid)`,
+      );
+      assertDeepEqual(
+        diaperButtons,
+        ['record-pee', 'record-poop', 'record-bath'],
+        '大小便卡片按钮顺序为 小便 / 大便 / 洗澡（v3 新增第三个）',
+      );
+      const bathRect = await page.rect(sel('record-bath'));
+      assert(
+        bathRect && Math.min(bathRect.width, bathRect.height) >= 44,
+        '洗澡按钮点击区 ≥ 44px',
+        bathRect ? `${Math.round(bathRect.width)}×${Math.round(bathRect.height)}px` : '未测量到',
+      );
+
+      // 清掉 G06 刚记录的大小便（它们会让 Hero 显示「刚刚」），构造「45 分钟前换尿布」的计时基准
+      const priorDiapers = (await api.allEvents()).filter((event) => event.kind === 'diaper');
+      for (const event of priorDiapers) await api.deleteEvent(event.id);
+      assertEqual(
+        (await api.allEvents()).filter((event) => event.kind === 'diaper').length,
+        0,
+        '清理已有大小便记录（构造 Hero 计时基准）',
+      );
+      const diaperAgo = Date.now() - 45 * 60_000;
+      const seededDiaper = await seedDiaper('pee', diaperAgo);
+      assertEqual(seededDiaper.status, 201, 'API 造 45 分钟前小便（Hero 计时对照）');
+      // 另造一条 50 分钟前的大便：Hero 仍取较晚的 45 分钟小便，同时保留「大便」数据供后续 CSV 断言使用
+      const seededPoop = await seedDiaper('poop', diaperAgo - 5 * 60_000);
+      assertEqual(seededPoop.status, 201, 'API 造 50 分钟前大便（保留大便数据）');
+      await page.reload();
+      const gapBeforeBath = await page.waitForExpression(
+        `(() => { const el = document.querySelector('[data-testid="gap-last-diaper"]'); const t = el ? el.textContent.trim() : ''; return ${CLEANING_GAP_RE}.test(t) ? t : false; })()`,
+        { timeout: 8000, desc: '洗澡前 Hero 第三行显示换尿布计时' },
+      );
+      assertMatch(gapBeforeBath, /^距上次换尿布\/洗澡 (44|45|46) 分钟$/, '洗澡前 Hero 显示「距上次换尿布/洗澡」约 45 分钟', `"${gapBeforeBath}"`);
+
+      const bathCountBefore = (await apiStateNow()).today.bathCount ?? 0;
+      const eventsBeforeBath = (await api.allEvents()).length;
+      const domBeforeBath = await domHistoryCount();
+
+      // 一键记录洗澡：POST /api/baths → toast → 时间线 / 今日汇总 / Hero
+      const bathSince = page.responses.length;
+      await page.clickTestId('record-bath');
+      const bathPost = await page.waitForResponse(
+        (response) => response.method === 'POST' && response.path === '/api/baths',
+        { since: bathSince },
+      );
+      assertEqual(bathPost.status, 201, '点击「洗澡」→ POST /api/baths → 201');
+      const bathToast = await page.waitForText(sel('toast'), '已记录 洗澡', { desc: '洗澡 toast' });
+      assertIncludes(bathToast, '已记录 洗澡', 'toast 文案「已记录 洗澡」', `"${bathToast}"`);
+      assert(await page.exists(sel('toast-undo')), '洗澡 toast 带撤销按钮');
+      const heroAfterBath = await page.waitForText(sel('gap-last-diaper'), '刚刚', { desc: '洗澡后 Hero 归零' });
+      assertEqual(heroAfterBath, '距上次换尿布/洗澡 刚刚', '洗澡重置 Hero「距上次换尿布/洗澡」为「刚刚」', `"${heroAfterBath}"`);
+      await page.waitHistoryCount(domBeforeBath + 1);
+      assertEqual(await firstHistoryTitle(), '洗澡', '时间线首条为「洗澡」');
+      const bathIcon = await page.evaluate(
+        `document.querySelector('[data-testid="history-list"] .event .event-icon').textContent.trim()`,
+      );
+      assertEqual(bathIcon, '🛁', '时间线洗澡记录图标为 🛁');
+      const summaryAfterBath = await page.textOfTestId('today-summary');
+      assertIncludes(summaryAfterBath, `洗澡 ${bathCountBefore + 1} 次`, '今日汇总洗澡次数 +1', `"${summaryAfterBath}"`);
+      const stateAfterBath = await apiStateNow();
+      assertEqual(stateAfterBath.today.bathCount, bathCountBefore + 1, '服务端 today.bathCount +1');
+      assertEqual(stateAfterBath.lastBath?.kind, 'bath', '服务端 lastBath.kind = "bath"');
+      assertEqual(stateAfterBath.lastBath?.feedTypes, null, 'lastBath.feedTypes = null');
+      assertEqual(stateAfterBath.lastBath?.amountMl, null, 'lastBath.amountMl = null');
+      assertEqual(stateAfterBath.lastBath?.diaperKind, null, 'lastBath.diaperKind = null');
+      assertEqual((await api.allEvents()).length, eventsBeforeBath + 1, '服务端事件数 +1');
+      const bathCreated = await latestEvent();
+      assertEqual(bathCreated?.kind, 'bath', '服务端最新记录 kind = "bath"');
+      await page.screenshot('bath-390.png');
+
+      // 撤销洗澡：toast-undo → DELETE → 服务端 bathCount 恢复 / Hero 回退到小便计时
+      const undoSince = page.responses.length;
+      await page.clickTestId('toast-undo');
+      const undoDelete = await page.waitForResponse(
+        (response) => response.method === 'DELETE' && /^\/api\/events\/\d+$/.test(response.path),
+        { since: undoSince },
+      );
+      assertEqual(undoDelete.status, 204, '撤销洗澡 → DELETE /api/events/:id → 204');
+      const undoToast = await page.waitForText(sel('toast'), '已撤销', { desc: '撤销洗澡 toast' });
+      assertIncludes(undoToast, '已撤销「洗澡」', '撤销 toast 文案「已撤销「洗澡」」', `"${undoToast}"`);
+      await page.waitForExpression(
+        `document.querySelectorAll('[data-testid="history-list"] .event').length === ${domBeforeBath}`,
+        { timeout: 8000, desc: '撤销后时间线恢复条数' },
+      );
+      assertEqual(await domHistoryCount(), domBeforeBath, '撤销后时间线恢复为记录前条数');
+      const stateAfterUndo = await waitApiState(
+        (state) => (state.today.bathCount ?? 0) === bathCountBefore,
+        { desc: '撤销后服务端 bathCount 恢复' },
+      );
+      assertEqual(stateAfterUndo.today.bathCount, bathCountBefore, '撤销后服务端 bathCount 恢复');
+      assertEqual(stateAfterUndo.lastBath, null, '撤销后服务端 lastBath = null（此前无洗澡记录）');
+      assertEqual((await api.allEvents()).length, eventsBeforeBath, '撤销后服务端事件数恢复');
+      const heroAfterUndo = await page.textOfTestId('gap-last-diaper');
+      assertMatch(
+        heroAfterUndo,
+        /^距上次换尿布\/洗澡 (44|45|46|47) 分钟$/,
+        '撤销洗澡后 Hero 回退到小便计时（约 45 分钟）',
+        `"${heroAfterUndo}"`,
+      );
+
+      // 持久化：再记录一次洗澡 → 刷新后仍在
+      const persistSince = page.responses.length;
+      await page.clickTestId('record-bath');
+      await page.waitForResponse((response) => response.method === 'POST' && response.path === '/api/baths', {
+        since: persistSince,
+      });
+      await page.waitForText(sel('toast'), '已记录 洗澡', { desc: '持久化测试洗澡 toast' });
+      await page.reload();
+      await page.waitHistoryCount(domBeforeBath + 1);
+      assertEqual(await firstHistoryTitle(), '洗澡', '刷新后洗澡记录仍在时间线首条（持久化）');
+      assertEqual((await apiStateNow()).lastBath?.kind, 'bath', '刷新后服务端 lastBath 仍为洗澡');
+      assertIncludes(await page.textOfTestId('gap-last-diaper'), '距上次换尿布/洗澡 刚刚', '刷新后 Hero 第三行仍显示洗澡计时「刚刚」');
+      assertIncludes(await page.textOfTestId('today-summary'), `洗澡 ${bathCountBefore + 1} 次`, '刷新后今日汇总仍包含新增洗澡');
+
+      // SSE：第二客户端（Node 直接 fetch API）记录洗澡 → 页面无需刷新实时出现
+      const currentToast = await page.exists(sel('toast'));
+      if (currentToast) {
+        // 页面刷新后不应有 toast；若存在旧 toast 先等它消失，避免「已同步」被撤销 toast 抑制
+        try {
+          await page.waitForGone(sel('toast'), { timeout: 6000 });
+        } catch {
+          await sleep(300);
+        }
+      }
+      const sseDomBefore = await domHistoryCount();
+      const sseBathCountBefore = (await apiStateNow()).today.bathCount ?? 0;
+      const sseBath = await seedBath();
+      assertEqual(sseBath.status, 201, '第二客户端直接 POST /api/baths → 201');
+      const sseApplied = await page.waitForExpression(
+        `document.querySelectorAll('[data-testid="history-list"] .event').length === ${sseDomBefore + 1}`,
+        { timeout: 6000, desc: 'SSE：他人洗澡记录实时出现在时间线' },
+      );
+      assert(Boolean(sseApplied), '第二客户端记录洗澡 → 页面无需刷新时间线 +1（SSE 实时）');
+      assertEqual(await firstHistoryTitle(), '洗澡', 'SSE 实时插入的时间线首条为「洗澡」');
+      const syncToast = await page.waitForText(sel('toast'), '已同步 洗澡', { timeout: 6000, desc: 'SSE 同步 toast' });
+      assertIncludes(syncToast, '已同步 洗澡', 'SSE 他人记录后页面提示「已同步 洗澡」', `"${syncToast}"`);
+      assertIncludes(await page.textOfTestId('today-summary'), `洗澡 ${sseBathCountBefore + 1} 次`, 'SSE 后今日汇总洗澡次数 +1');
+      assertEqual(await page.textOfTestId('gap-last-diaper'), '距上次换尿布/洗澡 刚刚', 'SSE 后 Hero 洗澡计时归零');
+      const sseState = await waitApiState((state) => (state.today.bathCount ?? 0) === sseBathCountBefore + 1, {
+        desc: 'SSE 后服务端 bathCount +1',
+      });
+      assertEqual(sseState.today.bathCount, sseBathCountBefore + 1, 'SSE 后服务端 bathCount +1');
+      assertEqual(sseState.lastBath?.id, sseBath.data?.event?.id, 'SSE 后服务端 lastBath 指向第二客户端记录');
     });
 
     /* ------------------------------------------------ G07 时间线删除（window.confirm） */
@@ -2153,24 +2479,40 @@ async function main() {
       assert(await page.isVisible(sel('empty-state')), '空库刷新后 empty-state 可见');
       assertEqual(await domHistoryCount(), 0, '时间线无记录条目');
       const summary = await page.textOfTestId('today-summary');
-      for (const part of ['喂奶 0 次', '奶量 0 ml', '亲喂 0 次', '小便 0', '大便 0']) {
+      for (const part of ['喂奶 0 次', '奶量 0 ml', '亲喂 0 次', '小便 0', '大便 0', '洗澡 0 次']) {
         assertIncludes(summary, part, `空库今日汇总含「${part}」`, `"${summary}"`);
       }
       assertEqual(await page.textOfTestId('gap-last-feed'), '还没有喂奶记录', 'Hero 提示「还没有喂奶记录」');
       assertEqual(await page.textOfTestId('gap-duration'), '还没开始', 'Hero 时长显示「还没开始」');
-      assertEqual(await page.textOfTestId('gap-last-diaper'), '还没有大小便记录', 'Hero 提示「还没有大小便记录」');
+      assertEqual(
+        await page.textOfTestId('gap-last-diaper'),
+        '还没有换尿布/洗澡记录',
+        'Hero 第三行提示 v3 文案「还没有换尿布/洗澡记录」',
+      );
       assert(!(await page.isVisible(sel('load-more'))), '空库时隐藏「加载更多」');
       assert(!(await page.isVisible(sel('load-error'))), '空库页面不显示错误条');
+      const emptyStatsText = await page.waitForText(sel('stats-chart'), '最近 7 天还没有数据', {
+        timeout: 8000,
+        desc: '空库趋势卡空状态',
+      });
+      assertIncludes(emptyStatsText, '最近 7 天还没有数据', '空库趋势卡显示「最近 7 天还没有数据」');
+      assertIncludes(
+        await page.textOfTestId('stats-summary'),
+        '7 天合计 0 ml',
+        '空库趋势汇总显示「7 天合计 0 ml · 日均 0 ml · 最高 0 ml」',
+      );
       const state = await apiStateNow();
       assertEqual(state.lastFeeding, null, '/api/state lastFeeding 为 null');
       assertEqual(state.lastDiaper, null, '/api/state lastDiaper 为 null');
+      assertEqual(state.lastBath, null, '/api/state lastBath 为 null');
       assertEqual(state.recent.length, 0, '/api/state recent 为空');
       assertEqual(state.today.totalMl, 0, '/api/state today.totalMl = 0');
+      assertEqual(state.today.bathCount, 0, '/api/state today.bathCount = 0');
       await page.screenshot('empty-390.png');
     });
 
-    /* ------------------------------------------------ G16 契约一致性抽查（HTTP / CORS / SERVE_WEB / 迁移） */
-    await runGroup('G16', '契约一致性抽查（API 字段 / 错误码 / CORS / SERVE_WEB=0 / v1→v2 迁移）', async () => {
+    /* ------------------------------------------------ G16 契约一致性抽查（HTTP / CORS / SERVE_WEB / v1→v3 迁移） */
+    await runGroup('G16', '契约一致性抽查（API 字段 / 错误码 / CORS / SERVE_WEB=0 / v1→v3 迁移）', async () => {
       // HTML 头 / CSP
       const html = await api.request('/');
       assertEqual(html.status, 200, 'GET / → 200（server 托管 web）');
@@ -2346,7 +2688,7 @@ async function main() {
         if (idx >= 0) extraServerProcesses.splice(idx, 1);
       }
 
-      // v1 → v2 数据库迁移（真实 server 打开旧库）
+      // v1 → v3 数据库迁移（真实 server 打开旧库；v3 迁移包含 v1→v3 直通与 v2→v3 放宽 kind CHECK）
       const { DatabaseSync } = await import('node:sqlite');
       const legacyDbPath = path.join(tmpDir, 'legacy-v1.db');
       const legacyTime = Date.now() - 3 * 3_600_000;
@@ -2404,7 +2746,7 @@ async function main() {
       const columns = migratedDb.prepare('PRAGMA table_info(events)').all().map((row) => row.name);
       const migratedCount = migratedDb.prepare('SELECT COUNT(*) AS n FROM events').get();
       migratedDb.close();
-      assertEqual(Number(versionRow?.user_version), 2, '迁移后 PRAGMA user_version = 2');
+      assertEqual(Number(versionRow?.user_version), 3, '迁移后 PRAGMA user_version = 3（v3 schema）');
       assert(columns.includes('feed_types') && !columns.includes('feed_type'), '迁移后表结构为 feed_types（旧列已替换）', columns.join(','));
       assertEqual(Number(migratedCount?.n), 3, '迁移后行数不变');
       // 迁移幂等：再次用同一 DB 启动 server，数据不重复、不报错
@@ -2428,8 +2770,256 @@ async function main() {
       assertEqual((await api.allEvents()).length, 0, '契约测试后主数据库为空');
     });
 
+    /* ------------------------------------------------ G16b v3 契约（洗澡 API / stats / CSV / v2→v3 迁移） */
+    await runGroup('G16b', 'v3 契约：洗澡 API / /api/stats / CSV 洗澡行 / v2→v3 迁移', async () => {
+      assertEqual((await api.allEvents()).length, 0, 'v3 契约测试起始数据库为空');
+
+      const expectV3Error = async (name, response, status, code) => {
+        assertEqual(response.status, status, `${name} → ${status}`);
+        assertEqual(response.data?.error, code, `${name} error=${code}`);
+        assert(
+          typeof response.data?.message === 'string' && /[\u4e00-\u9fa5]/.test(response.data.message),
+          `${name} message 为中文`,
+          JSON.stringify(response.data?.message),
+        );
+      };
+
+      // ---- POST /api/baths 成功路径与 Event 结构
+      const bath1 = await api.createBath({});
+      assertEqual(bath1.status, 201, 'POST /api/baths（空对象 body）→ 201');
+      const bathEvent = bath1.data?.event ?? {};
+      assertDeepEqual(
+        Object.keys(bathEvent).sort(),
+        ['amountMl', 'createdAt', 'diaperKind', 'feedTypes', 'happenedAt', 'id', 'kind', 'note'],
+        '洗澡 Event JSON 字段与契约一致（无多余/缺失字段）',
+      );
+      assertEqual(bathEvent.kind, 'bath', '洗澡事件 kind = "bath"');
+      assertEqual(bathEvent.feedTypes, null, '洗澡事件 feedTypes = null');
+      assertEqual(bathEvent.amountMl, null, '洗澡事件 amountMl = null');
+      assertEqual(bathEvent.diaperKind, null, '洗澡事件 diaperKind = null');
+      assertEqual(bathEvent.note, null, '洗澡事件 note 默认 null');
+      assert(
+        typeof bathEvent.happenedAt === 'number' && typeof bathEvent.createdAt === 'number',
+        '洗澡事件时间为 epoch 毫秒 number',
+      );
+      const stateAfterBath1 = await apiStateNow();
+      assertEqual(stateAfterBath1.lastBath?.id, bathEvent.id, '/api/state lastBath 指向最新洗澡');
+      assertEqual(stateAfterBath1.today.bathCount, 1, '/api/state today.bathCount = 1');
+
+      const bathTime = Date.now() - 90 * 60_000;
+      const bath2 = await api.createBath({ note: '  洗香香  ', happenedAt: bathTime });
+      assertEqual(bath2.status, 201, 'POST /api/baths 带 note/happenedAt → 201');
+      assertEqual(bath2.data?.event?.note, '洗香香', '洗澡备注 trim 后保存');
+      assertEqual(bath2.data?.event?.happenedAt, bathTime, '洗澡 happenedAt 原样保存');
+      const stateAfterBath2 = await apiStateNow();
+      assertEqual(stateAfterBath2.lastBath?.id, bathEvent.id, 'lastBath 取发生时间较晚者（bath2 更早）');
+      assertEqual(stateAfterBath2.today.bathCount, 2, '同日两条洗澡 bathCount = 2');
+
+      const threeDaysAgo = Date.now() - 3 * 86_400_000;
+      const oldBath = await api.createBath({ happenedAt: threeDaysAgo, note: '三天前' });
+      assertEqual(oldBath.status, 201, 'POST /api/baths 补记三天前洗澡 → 201');
+      assertEqual((await apiStateNow()).today.bathCount, 2, '补记非今天洗澡不改变 today.bathCount');
+
+      // ---- POST /api/baths 校验/错误码
+      await expectV3Error('洗澡 note 超长（201 字符）', await api.createBath({ note: 'x'.repeat(201) }), 400, 'invalid_note');
+      await expectV3Error('洗澡 note 非字符串', await api.createBath({ note: 123 }), 400, 'invalid_note');
+      await expectV3Error(
+        '洗澡 happenedAt 超前 10 分钟',
+        await api.createBath({ happenedAt: Date.now() + 10 * 60_000 }),
+        400,
+        'invalid_happened_at',
+      );
+      await expectV3Error('洗澡 happenedAt 字符串', await api.createBath({ happenedAt: '123' }), 400, 'invalid_happened_at');
+      await expectV3Error(
+        '洗澡 happenedAt 早于 2000-01-01',
+        await api.createBath({ happenedAt: 946_684_799_999 }),
+        400,
+        'invalid_happened_at',
+      );
+      await expectV3Error(
+        '洗澡非法 JSON 体',
+        await api.request('/api/baths', { method: 'POST', body: '{', headers: { 'Content-Type': 'application/json' } }),
+        400,
+        'invalid_json',
+      );
+      await expectV3Error(
+        '洗澡 Content-Type 非 JSON',
+        await api.request('/api/baths', { method: 'POST', body: 'x', headers: { 'Content-Type': 'text/plain' } }),
+        415,
+        'unsupported_media_type',
+      );
+      await expectV3Error(
+        '洗澡请求体超大（>64KB）',
+        await api.request('/api/baths', {
+          method: 'POST',
+          body: JSON.stringify({ note: 'x'.repeat(70 * 1024) }),
+          headers: { 'Content-Type': 'application/json' },
+        }),
+        413,
+        'payload_too_large',
+      );
+      // 非法请求不应产生记录
+      const eventsAfterBathErrors = await api.allEvents();
+      assertEqual(eventsAfterBathErrors.length, 3, '非法洗澡请求均未落库（仅 3 条合法洗澡记录）');
+
+      // ---- GET /api/stats 形状 / 参数 / 与 state 口径一致
+      const defaultStats = await api.stats();
+      assertEqual(defaultStats.status, 200, 'GET /api/stats（不带参数）→ 200');
+      assertEqual(defaultStats.data?.days, 7, 'GET /api/stats 默认 days = 7');
+      assertEqual(defaultStats.data?.daily?.length, 7, 'daily 长度 = days');
+      assert(
+        typeof defaultStats.data?.startDate === 'string' && typeof defaultStats.data?.endDate === 'string',
+        '响应含 startDate / endDate',
+      );
+      assertEqual(defaultStats.data?.endDate, formatDayKeyNode(Date.now()), '默认 tz 下 endDate = 今天（本地日历）');
+      assertDeepEqual(
+        Object.keys(defaultStats.data.daily[0]).sort(),
+        [
+          'bathCount',
+          'breastDirectCount',
+          'breastMilkCount',
+          'date',
+          'diaperCount',
+          'feedCount',
+          'formulaCount',
+          'mixedCount',
+          'mixedFeedCount',
+          'peeCount',
+          'poopCount',
+          'totalMl',
+        ],
+        'daily 每项字段与契约 §5 一致（含 v3 bathCount）',
+      );
+      const datesAsc = defaultStats.data.daily.map((item) => item.date);
+      assert(
+        datesAsc.every((date, index) => index === 0 || date > datesAsc[index - 1]),
+        'daily 按日期升序且连续',
+        datesAsc.join(','),
+      );
+      const stateForStats = await api.state(tzOffset);
+      const statsToday = (await api.stats(7, tzOffset)).data;
+      const lastDaily = statsToday.daily[statsToday.daily.length - 1];
+      assertEqual(lastDaily.date, stateForStats.today.date, 'stats 最后一天日期 = /api/state today.date（同 tzOffset）');
+      assertDeepEqual(lastDaily, stateForStats.today, 'stats 最后一天聚合与 /api/state today 完全一致（同一套口径）');
+      assertEqual(lastDaily.bathCount, 2, '今天 bathCount = 2（两条今天的洗澡）');
+      const day3 = statsToday.daily[statsToday.daily.length - 4];
+      assertEqual(day3.bathCount, 1, '三天前那天的 bathCount = 1');
+      assertEqual(
+        statsToday.daily.reduce((sum, item) => sum + item.bathCount, 0),
+        3,
+        '7 天窗口 bathCount 合计 = 3',
+      );
+      // 合法 days 范围 1..90
+      for (const days of [1, 30, 90]) {
+        const ranged = await api.stats(days);
+        assertEqual(ranged.status, 200, `GET /api/stats?days=${days} → 200`);
+        assertEqual(ranged.data?.days, days, `days=${days} 回显正确`);
+        assertEqual(ranged.data?.daily?.length, days, `days=${days} daily 长度正确`);
+      }
+      // 非法 days / tzOffset
+      for (const [raw, label] of [
+        ['0', 'days=0'],
+        ['91', 'days=91'],
+        ['abc', 'days=abc'],
+        ['1.5', 'days=1.5'],
+        ['-1', 'days=-1'],
+      ]) {
+        await expectV3Error(`GET /api/stats ${label}`, await api.request(`/api/stats?days=${encodeURIComponent(raw)}`), 400, 'invalid_days');
+      }
+      await expectV3Error('GET /api/stats tzOffset=9999', await api.request('/api/stats?tzOffset=9999'), 400, 'invalid_tz_offset');
+      await expectV3Error('GET /api/stats tzOffset=abc', await api.request('/api/stats?tzOffset=abc'), 400, 'invalid_tz_offset');
+      // tzOffset 语义：days=1 的 endDate 应等于该固定时区下的「今天」
+      const tzProbe = async (offset) => {
+        const response = await api.request(`/api/stats?days=1&tzOffset=${offset}`);
+        return response.data;
+      };
+      const tzMinus480 = await tzProbe(-480);
+      const tzPlus840 = await tzProbe(840);
+      const dateKeyForOffset = (ts, offsetMinutes) => {
+        const shifted = new Date(ts - offsetMinutes * 60_000);
+        const pad = (n) => (n < 10 ? `0${n}` : String(n));
+        return `${shifted.getUTCFullYear()}-${pad(shifted.getUTCMonth() + 1)}-${pad(shifted.getUTCDate())}`;
+      };
+      assertEqual(tzMinus480?.endDate, dateKeyForOffset(Date.now(), -480), 'tzOffset=-480 的 endDate 符合固定偏移日历口径');
+      assertEqual(tzPlus840?.endDate, dateKeyForOffset(Date.now(), 840), 'tzOffset=+840 的 endDate 符合固定偏移日历口径');
+
+      // ---- CSV 洗澡行
+      const csvBath = await api.exportCsv();
+      assertEqual(csvBath.status, 200, 'GET /api/export.csv → 200');
+      const csvLines = csvBath.text.replace(/^\uFEFF/, '').split('\r\n').filter((line) => line.length > 0);
+      assertEqual(csvLines[0], '时间,类别,项目,奶量(ml),备注', 'CSV 表头符合 v3 契约');
+      const bathRows = csvLines.filter((line) => line.includes(',洗澡,洗澡,'));
+      assertEqual(bathRows.length, 3, 'CSV 中 3 条洗澡行（类别=洗澡、项目=洗澡）');
+      assertMatch(bathRows[0], /^\d{4}-\d{2}-\d{2} \d{2}:\d{2},洗澡,洗澡,,/, 'CSV 洗澡行格式：时间,洗澡,洗澡,,备注', bathRows[0]);
+      assertIncludes(csvLines.join('\n'), '洗香香', 'CSV 洗澡行包含备注');
+
+      // ---- v2 → v3 迁移（kind CHECK 仅 feed/diaper 的旧库）
+      const { DatabaseSync } = await import('node:sqlite');
+      const v2DbPath = path.join(tmpDir, 'legacy-v2.db');
+      const t0 = Date.now() - 5 * 3_600_000;
+      const v2Db = new DatabaseSync(v2DbPath);
+      v2Db.exec(`CREATE TABLE IF NOT EXISTS events (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        kind        TEXT    NOT NULL CHECK (kind IN ('feed', 'diaper')),
+        feed_types  TEXT,
+        amount_ml   INTEGER CHECK (amount_ml IS NULL OR (amount_ml >= 1 AND amount_ml <= 2000)),
+        diaper_kind TEXT    CHECK (diaper_kind IN ('pee', 'poop', 'mixed')),
+        note        TEXT,
+        happened_at INTEGER NOT NULL,
+        created_at  INTEGER NOT NULL,
+        CHECK (
+          (kind = 'feed' AND feed_types IS NOT NULL AND diaper_kind IS NULL)
+          OR
+          (kind = 'diaper' AND feed_types IS NULL AND amount_ml IS NULL AND diaper_kind IS NOT NULL)
+        )
+      );`);
+      const v2Insert = v2Db.prepare(
+        'INSERT INTO events (id, kind, feed_types, amount_ml, diaper_kind, note, happened_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+      );
+      v2Insert.run(1, 'feed', JSON.stringify(['formula', 'breast_milk']), 150, null, 'v2 老记录', t0, t0 + 1000);
+      v2Insert.run(2, 'diaper', null, null, 'pee', null, t0 + 60_000, t0 + 61_000);
+      v2Db.exec('PRAGMA user_version = 2');
+      v2Db.close();
+
+      const v2Port = await freePort();
+      const v2Server = launchServer({ port: v2Port, dbPath: v2DbPath, label: 'migrate-v2' });
+      extraServerProcesses.push(v2Server);
+      try {
+        const v2Api = `http://127.0.0.1:${v2Port}`;
+        await waitHealth(v2Api);
+        const v2Client = new ApiClient(v2Api);
+        const migrated = await v2Client.events(10);
+        assertEqual(migrated.length, 2, 'v2 旧库 2 条记录迁移后全部保留');
+        assertDeepEqual(migrated.find((item) => item.id === 1)?.feedTypes, ['formula', 'breast_milk'], 'v2 多标签 feedTypes 迁移后保留');
+        assertEqual(migrated.find((item) => item.id === 1)?.amountMl, 150, 'v2 奶量迁移后保留');
+        assertEqual(migrated.find((item) => item.id === 2)?.diaperKind, 'pee', 'v2 大小便迁移后保留');
+        const migratedBath = await v2Client.createBath({ note: '迁移后洗澡' });
+        assertEqual(migratedBath.status, 201, 'v2→v3 迁移后 kind CHECK 已放宽：可记录洗澡 → 201');
+        assertEqual(migratedBath.data?.event?.kind, 'bath', '迁移后写入的洗澡 kind = "bath"');
+        assertEqual((await v2Client.events(10)).length, 3, '迁移后洗澡成功落库（3 条）');
+      } finally {
+        await stopProcess(v2Server.child, 'server');
+        const idx = extraServerProcesses.indexOf(v2Server);
+        if (idx >= 0) extraServerProcesses.splice(idx, 1);
+      }
+      const v2MigratedDb = new DatabaseSync(v2DbPath);
+      const v2VersionRow = v2MigratedDb.prepare('PRAGMA user_version').get();
+      const v2Columns = v2MigratedDb.prepare('PRAGMA table_info(events)').all().map((row) => row.name);
+      v2MigratedDb.close();
+      assertEqual(Number(v2VersionRow?.user_version), 3, 'v2→v3 迁移后 PRAGMA user_version = 3');
+      assert(v2Columns.includes('feed_types'), 'v2→v3 迁移后表结构仍为 feed_types 列', v2Columns.join(','));
+      for (const suffix of ['', '-wal', '-shm']) {
+        await rm(`${v2DbPath}${suffix}`, { force: true });
+      }
+
+      // ---- 清理
+      const cleanedV3 = await deleteAllEvents();
+      assertEqual(cleanedV3.deleted, cleanedV3.total, '清理 v3 契约测试数据');
+      assertEqual((await api.allEvents()).length, 0, 'v3 契约测试后主数据库为空');
+    });
+
     /* ------------------------------------------------ G17 CLI 端到端（同一临时后端） */
-    await runGroup('G17', 'CLI 端到端：status / feed / pee / log / today / undo / rm / export / config / 错误码', async () => {
+    await runGroup('G17', 'CLI 端到端：status / feed / pee / bath / log / today / undo / rm / export / config / 错误码', async () => {
       assertEqual((await api.allEvents()).length, 0, 'CLI 测试起始数据库为空');
       const deadServer = 'http://127.0.0.1:1';
       const cliEnv = { XDG_CONFIG_HOME: cliConfigDirPath };
@@ -2539,7 +3129,7 @@ async function main() {
         expectedAt = new Date(yesterday.getFullYear(), yesterday.getMonth(), yesterday.getDate(), 20, 0, 0, 0).getTime();
       }
       const feedAt = await run(['f', '45', '--at', atArg, '--json']);
-      assertEqual(feedAt.code, 0, `CLI f --at "${atArg}" exit 0`, feedAt.stderrText.slice(0, 200));
+      assertEqual(feedAt.code, 0, 'CLI f --at HH:MM exit 0', feedAt.stderrText.slice(0, 200));
       assertEqual(parseJson(feedAt, 'f')?.event?.happenedAt, expectedAt, 'CLI --at 解析为期望的本地时间戳');
 
       const feedNote = await run(['f', '30', '--note', '夜里那次', '--json']);
@@ -2563,6 +3153,81 @@ async function main() {
       assertEqual(diaperState.today.peeCount, 2, 'CLI 后服务端 peeCount=2（含 mixed）');
       assertEqual(diaperState.today.poopCount, 2, 'CLI 后服务端 poopCount=2（含 mixed）');
       assertEqual(diaperState.today.mixedCount, 1, 'CLI 后服务端 mixedCount=1');
+
+      // ---- v3 洗澡：naiji bath / b（--note / --ago / --json / 文本输出）
+      const bathCountBeforeCli = (await apiStateNow()).today.bathCount ?? 0;
+      const cliBathRun = await run(['bath', '--json']);
+      assertEqual(cliBathRun.code, 0, 'CLI bath --json exit 0', cliBathRun.stderrText.slice(0, 200));
+      const cliBathJson = parseJson(cliBathRun, 'bath');
+      assertEqual(cliBathJson?.event?.kind, 'bath', 'CLI bath --json 返回 kind="bath"');
+      assertEqual(cliBathJson?.event?.feedTypes, null, 'CLI bath event.feedTypes=null');
+      assertEqual(cliBathJson?.event?.amountMl, null, 'CLI bath event.amountMl=null');
+      assertEqual(cliBathJson?.event?.diaperKind, null, 'CLI bath event.diaperKind=null');
+      const bathCliState = await apiStateNow();
+      assertEqual(bathCliState.today.bathCount, bathCountBeforeCli + 1, 'CLI bath 后服务端 today.bathCount +1');
+      assertEqual(bathCliState.lastBath?.id, cliBathJson?.event?.id, 'CLI bath 后服务端 lastBath 指向该记录');
+
+      const bathAgoBefore = Date.now();
+      const cliBathAgo = await run(['bath', '--ago', '30', '--json']);
+      const bathAgoAfter = Date.now();
+      assertEqual(cliBathAgo.code, 0, 'CLI bath --ago 30 --json exit 0', cliBathAgo.stderrText.slice(0, 200));
+      const bathAgoEvent = parseJson(cliBathAgo, 'bath')?.event;
+      const expectedBathAgo = bathAgoBefore - 30 * 60_000;
+      assert(
+        Math.abs((bathAgoEvent?.happenedAt ?? 0) - expectedBathAgo) <= 5000,
+        'CLI bath --ago 30 的 happenedAt ≈ 30 分钟前',
+        `差 ${(bathAgoEvent?.happenedAt ?? 0) - expectedBathAgo}ms`,
+      );
+      assert(
+        bathAgoEvent.happenedAt >= bathAgoBefore - 30 * 60_000 - 5000 && bathAgoEvent.happenedAt <= bathAgoAfter - 30 * 60_000 + 5000,
+        'CLI bath --ago 时间落在执行窗口内',
+      );
+
+      const cliBathNote = await run(['b', '--note', '洗香香', '--json']);
+      assertEqual(cliBathNote.code, 0, 'CLI b --note 洗香香 --json exit 0');
+      assertEqual(parseJson(cliBathNote, 'b')?.event?.note, '洗香香', 'CLI bath --note 写入备注');
+
+      const cliBathText = await run(['bath', '--no-color']);
+      assertEqual(cliBathText.code, 0, 'CLI bath 文本模式 exit 0');
+      assertMatch(cliBathText.stdoutText, /已记录 洗澡 . \d{2}:\d{2}/, 'CLI bath 文本输出「✅ 已记录 洗澡 · HH:MM」', JSON.stringify(cliBathText.stdoutText.trim()));
+      assert(!cliBathText.stdoutText.includes('\u001b'), 'CLI bath 非 TTY 输出无 ANSI 颜色码');
+
+      // status / today / log 的洗澡文案
+      const statusWithBath = await runCli(['status', '--server', apiBase, '--no-color'], { env: cliEnv });
+      assertEqual(statusWithBath.code, 0, 'CLI status（有洗澡数据）exit 0');
+      assertIncludes(statusWithBath.stdoutText, '距上次换尿布/洗澡', 'CLI status 输出 v3 文案「距上次换尿布/洗澡」');
+      assertMatch(statusWithBath.stdoutText, /距上次换尿布\/洗澡\s+(刚刚|\d+ 分钟|\d+ 小时( \d+ 分钟)?)/, 'CLI status 换尿布/洗澡计时格式正确');
+      assertMatch(statusWithBath.stdoutText, /今日 .*洗澡 \d+ 次/, 'CLI status 今日汇总含「洗澡 N 次」', JSON.stringify(statusWithBath.stdoutText.trim()));
+      const todayBathState = await apiStateNow();
+      assertIncludes(
+        statusWithBath.stdoutText,
+        `洗澡 ${todayBathState.today.bathCount} 次`,
+        'CLI status 洗澡次数与服务端 today.bathCount 一致',
+      );
+      const todayTextRun = await run(['today', '--no-color']);
+      assertEqual(todayTextRun.code, 0, 'CLI today 文本模式 exit 0');
+      assertIncludes(todayTextRun.stdoutText, '洗澡', 'CLI today 输出包含洗澡记录/汇总');
+      const logTextRun = await run(['log', '-n', '30', '--no-color']);
+      assertEqual(logTextRun.code, 0, 'CLI log 文本模式 exit 0');
+      assertIncludes(logTextRun.stdoutText, '洗澡', 'CLI log 输出包含洗澡记录');
+      const logJsonBath = await run(['log', '-n', '30', '--json']);
+      const logBathEvents = (parseJson(logJsonBath, 'log')?.events ?? []).filter((item) => item.kind === 'bath');
+      assert(logBathEvents.length >= 3, 'CLI log --json 返回的洗澡记录 ≥ 3 条', `${logBathEvents.length} 条`);
+
+      // undo 删除洗澡
+      const bathForUndo = await run(['b', '--json']);
+      assertEqual(bathForUndo.code, 0, 'CLI 记录一条待撤销洗澡 exit 0');
+      const bathForUndoId = parseJson(bathForUndo, 'b')?.event?.id;
+      const undoBathRun = await run(['undo', '--json']);
+      assertEqual(undoBathRun.code, 0, 'CLI undo 撤销洗澡 exit 0');
+      const undoBathJson = parseJson(undoBathRun, 'undo');
+      assertEqual(undoBathJson?.deleted?.id, bathForUndoId, 'CLI undo 删除最近一条洗澡');
+      assertEqual(undoBathJson?.deleted?.kind, 'bath', 'CLI undo 输出的被删记录 kind="bath"');
+      assert(!(await api.allEvents()).some((item) => item.id === bathForUndoId), 'CLI undo 后该洗澡记录从服务端消失');
+
+      // 洗澡用法错误：多余位置参数 / 非法 --ago
+      await expectUsage(['bath', 'extra', '--json'], 'CLI bath 多余位置参数', '不接受参数');
+      await expectUsage(['bath', '--ago', 'abc', '--json'], 'CLI bath 非法 --ago', '--ago 必须是分钟数');
 
       // log / today 与服务端一致
       const apiEvents = await api.events(200);
@@ -2723,6 +3388,337 @@ async function main() {
       }
     });
 
+    /* ------------------------------------------------ G18b 趋势卡（v3 新增） */
+    await runGroup('G18b', '趋势卡：7/30 天 · 6 指标 · 与 /api/stats 一致 · 空状态 · 响应式 · 深色', async () => {
+      // 清库并造 10 天多类型数据（含今天）：每天都有喂奶，间隔出现亲喂/大小便/洗澡，覆盖 6 个指标
+      const clearedForStats = await deleteAllEvents();
+      assertEqual(clearedForStats.deleted, clearedForStats.total, '清空时间线数据（趋势卡用干净数据集）');
+      const seedNow = Date.now();
+      const seedResponses = [];
+      for (let offset = 0; offset < 10; offset += 1) {
+        const ts = offset === 0 ? seedNow - 900 : seedNow - offset * 86_400_000;
+        seedResponses.push(await seedFeed(['formula', 'breast_milk'], 100 + offset * 10, ts));
+        if (offset % 2 === 0) seedResponses.push(await seedFeed(['breast_direct'], undefined, ts));
+        if (offset % 3 === 0) seedResponses.push(await seedFeed(['formula'], 60, ts));
+        if (offset % 2 === 1) seedResponses.push(await seedDiaper('pee', ts));
+        if (offset % 4 === 0) seedResponses.push(await seedDiaper('poop', ts));
+        if (offset % 5 === 0) seedResponses.push(await seedDiaper('mixed', ts));
+        if (offset % 3 === 0) seedResponses.push(await seedBath(ts, offset === 0 ? '今晚洗澡' : undefined));
+      }
+      assertEqual(seedResponses.filter((response) => response.status === 201).length, seedResponses.length, 'API 造 10 天多类型趋势数据（全部 201）');
+      assert(seedResponses.length >= 30, '趋势数据集覆盖 6 个指标（事件数 ≥ 30）', `${seedResponses.length} 条`);
+
+      const api7 = (await api.stats(7, tzOffset)).data;
+      const api30 = (await api.stats(30, tzOffset)).data;
+      assertEqual(api7?.days, 7, 'GET /api/stats?days=7 回显 days=7');
+      assertEqual(api30?.days, 30, 'GET /api/stats?days=30 回显 days=30');
+      const expected7Dates = [...Array(7)].map((_, index) => formatDayKeyNode(seedNow - (6 - index) * 86_400_000));
+      assertDeepEqual(api7.daily.map((item) => item.date), expected7Dates, '7 天窗口日期 = 最近 7 个本地日历天（升序）');
+      assertDeepEqual(api7.daily[6], (await api.state(tzOffset)).today, 'stats 最后一天与 /api/state today 聚合一致（同 tzOffset）');
+
+      // 页面刷新 → 趋势卡渲染 7 天视图
+      await page.reload();
+      await page.evaluate(`document.querySelector('[data-testid="stats-card"]').scrollIntoView({ block: 'center' })`);
+      await waitStatsPoints(7);
+      assert(await page.isVisible(sel('stats-card')), '趋势卡 stats-card 可见');
+      assert(await page.isVisible(sel('stats-chart')), '趋势图 stats-chart 可见');
+      assert(await page.isVisible(sel('stats-summary')), '趋势汇总 stats-summary 可见');
+      const cardOrder = await page.evaluate(`(() => {
+        const summary = document.querySelector('[data-testid="today-summary"]');
+        const stats = document.querySelector('[data-testid="stats-card"]');
+        const timeline = document.querySelector('[data-testid="history-list"]');
+        const top = (el) => el.getBoundingClientRect().top;
+        return { summary: top(summary), stats: top(stats), timeline: top(timeline) };
+      })()`);
+      assert(
+        cardOrder.summary < cardOrder.stats && cardOrder.stats < cardOrder.timeline,
+        '趋势卡位于「今日汇总」之后、「记录时间线」之前',
+        `summary=${Math.round(cardOrder.summary)} stats=${Math.round(cardOrder.stats)} timeline=${Math.round(cardOrder.timeline)}`,
+      );
+      assertEqual(await page.attr(sel('stats-range-7'), 'aria-pressed'), 'true', '默认选中 7 天范围');
+      assertEqual(await page.attr(sel('stats-range-30'), 'aria-pressed'), 'false', '30 天范围默认未选中');
+      const svgInfo = await page.evaluate(`(() => {
+        const chart = document.querySelector('[data-testid="stats-chart"]');
+        const svg = chart.querySelector('svg');
+        return { svgCount: chart.querySelectorAll('svg').length, canvasCount: chart.querySelectorAll('canvas').length, role: chart.getAttribute('role'), aria: chart.getAttribute('aria-label') };
+      })()`);
+      assertEqual(svgInfo.svgCount, 1, '趋势图是内联 SVG（恰好 1 个 <svg>）');
+      assertEqual(svgInfo.canvasCount, 0, '趋势图不依赖 canvas');
+      assertEqual(svgInfo.role, 'img', '趋势图容器 role="img"（无障碍）');
+      assertEqual(svgInfo.aria, '最近 7 天奶量趋势', '趋势图 aria-label 概括当前范围与指标');
+
+      // 触控目标尺寸（契约 §6 保留 v1「≥48px 点击区」；项目既有 e2e 标准为 ≥44px）
+      const statsTargets = await page.evaluate(`(() => {
+        const items = [
+          ['stats-range-7', '[data-testid="stats-range-7"]'],
+          ['stats-range-30', '[data-testid="stats-range-30"]'],
+          ...['totalMl', 'feedCount', 'breastDirectCount', 'peeCount', 'poopCount', 'bathCount'].map((key) => [
+            'stats-metric-' + key,
+            '[data-testid="stats-metric-' + key + '"]',
+          ]),
+        ];
+        return items.map(([name, selector]) => {
+          const el = document.querySelector(selector);
+          if (!el) return { name, missing: true };
+          const rect = el.getBoundingClientRect();
+          return { name, width: rect.width, height: rect.height };
+        });
+      })()`);
+      assert(
+        statsTargets.length === 8 && statsTargets.every((item) => !item.missing && item.width > 1 && item.height > 1),
+        '趋势卡 8 个范围/指标按钮全部存在且可测量',
+        statsTargets.map((item) => item.name).join(', '),
+      );
+      const smallStatsTargets = statsTargets.filter((item) => Math.min(item.width, item.height) < 44);
+      if (smallStatsTargets.length === 0) {
+        assert(true, '趋势卡可点击控件均 ≥44px（触控友好）');
+      } else {
+        note(
+          '趋势卡部分可点击控件 < 44px（P2 可触控性）',
+          `${smallStatsTargets.map((item) => `${item.name} ${Math.round(item.width)}×${Math.round(item.height)}px`).join('；')}；契约 §6 保留 v1「≥48px 点击区」的约束，项目 e2e 既有标准为 ≥44px，建议统一提升到 44–48px`,
+        );
+      }
+
+      let snap7 = await pageStatsSnapshot();
+      assertEqual(snap7.circles, 7, '7 天视图折线数据点 = 7');
+      assertEqual(snap7.lineSegments, 7, '7 天视图折线由 7 个数据点连成（M + 6×L）');
+      if (snap7.polyline === 0) {
+        note(
+          '折线实现为 SVG <path> 而非 <polyline>',
+          'CONTRACT §6.4 只要求「折线 + 面积渐变 + 数据点」；web 用 <path>（L 段）+ <circle> 实现，数据点数量按 circle 断言，polyline=0 不是缺陷，仅为任务书措辞差异',
+        );
+      }
+      assertEqual(snap7.gridLineCount, 3, 'Y 轴 3 条网格线');
+      assertEqual(snap7.xLabels.length, 7, '7 天视图 X 轴显示全部 7 个日期');
+      assertDeepEqual(snap7.xLabels, api7.daily.map((item) => item.date.slice(5)), '7 天 X 轴日期标签与 API daily 日期一致');
+      assertEqual(snap7.valueLabels.length, 7, '7 天视图每个数据点都有数值标签');
+      const totalMl7 = statsValuesNode(api7.daily, 'totalMl');
+      assertDeepEqual(snap7.valueLabels, totalMl7.map((value) => String(value)), '7 天视图各点数值 = GET /api/stats.totalMl');
+      assertEqual(
+        snap7.summary,
+        statsSummaryExpectedNode(api7.daily, 7, STATS_METRICS[0]),
+        'stats-summary 文本 = 「7 天合计 X · 日均 Y · 最高 M（MM-DD）」且与 API 数据一致',
+      );
+
+      // 6 个指标逐个切换：数值 + 汇总与 API 对应字段一致（首末点显式对比）
+      for (const metric of STATS_METRICS) {
+        await page.clickTestId(`stats-metric-${metric.key}`);
+        await page.waitForExpression(
+          `document.querySelector('[data-testid="stats-chart"]').getAttribute('aria-label') === ${jsString(`最近 7 天${metric.label}趋势`)}`,
+          { timeout: 4000, desc: `指标切换为 ${metric.label}` },
+        );
+        const metricSnap = await pageStatsSnapshot();
+        const metricValues = statsValuesNode(api7.daily, metric.key);
+        assertEqual(metricSnap.circles, 7, `${metric.label}：7 天视图数据点 = 7`);
+        assertDeepEqual(
+          metricSnap.valueLabels,
+          metricValues.map((value) => String(value)),
+          `${metric.label}：7 天各点数值与 GET /api/stats.${metric.key} 一致`,
+        );
+        assertEqual(metricSnap.valueLabels[0], String(metricValues[0]), `${metric.label}：图表首点 = API 第 1 天`);
+        assertEqual(metricSnap.valueLabels[6], String(metricValues[6]), `${metric.label}：图表末点 = API 第 7 天（今天）`);
+        assertEqual(
+          metricSnap.summary,
+          statsSummaryExpectedNode(api7.daily, 7, metric),
+          `${metric.label}：stats-summary 合计/日均/最高与 API 数据一致`,
+        );
+        assertEqual(
+          await page.attr(sel(`stats-metric-${metric.key}`), 'aria-pressed'),
+          'true',
+          `${metric.label}：指标按钮 aria-pressed=true`,
+        );
+      }
+
+      // 30 天视图：30 个点、X 轴每 5 天一个标签、只标最高点、汇总与 API 一致
+      await page.clickTestId('stats-metric-totalMl');
+      await sleep(150);
+      await page.clickTestId('stats-range-30');
+      await waitStatsPoints(30);
+      const snap30 = await pageStatsSnapshot();
+      assertEqual(snap30.circles, 30, '30 天视图折线数据点 = 30');
+      assertEqual(snap30.lineSegments, 30, '30 天视图折线由 30 个数据点连成');
+      assertEqual(snap30.range30, 'true', '切换到 30 天后 aria-pressed 状态正确');
+      assertEqual(snap30.aria, '最近 30 天奶量趋势', '30 天视图 aria-label 更新');
+      const expected30X = api30.daily
+        .filter((_item, index) => (api30.daily.length - 1 - index) % STATS_X_LABEL_EVERY === 0)
+        .map((item) => item.date.slice(5));
+      assertDeepEqual(snap30.xLabels, expected30X, `30 天视图 X 轴每 ${STATS_X_LABEL_EVERY} 天一个标签（最后一个是今天）`);
+      assertEqual(snap30.xLabels.length, 6, '30 天视图 X 轴标签数量符合「每 5 天一个」（30 天窗口共 6 个）');
+      assertEqual(snap30.xLabels[snap30.xLabels.length - 1], formatDayKeyNode(seedNow).slice(5), '30 天视图最后一个 X 标签是今天');
+      assertEqual(snap30.valueLabels.length, 1, '30 天视图只标注最高点（1 个数值标签）');
+      const totalMl30 = statsValuesNode(api30.daily, 'totalMl');
+      assertEqual(snap30.valueLabels[0], String(Math.max(...totalMl30)), '30 天视图最高点数值 = API 30 天最大值');
+      assertEqual(
+        snap30.summary,
+        statsSummaryExpectedNode(api30.daily, 30, STATS_METRICS[0]),
+        '30 天视图 stats-summary 合计/日均/最高与 API 一致',
+      );
+
+      // 范围切换命中缓存：7↔30 重复切换不再发 /api/stats 请求（契约「切换范围时拉取并缓存」）
+      const statsRequestCountBefore = page.countRequests(
+        (request) => request.method === 'GET' && request.url.includes('/api/stats'),
+      );
+      await page.clickTestId('stats-range-7');
+      await waitStatsPoints(7);
+      await page.clickTestId('stats-range-30');
+      await waitStatsPoints(30);
+      await page.clickTestId('stats-range-7');
+      await waitStatsPoints(7);
+      await sleep(300);
+      const statsRequestCountAfter = page.countRequests(
+        (request) => request.method === 'GET' && request.url.includes('/api/stats'),
+      );
+      assertEqual(statsRequestCountAfter, statsRequestCountBefore, '7/30 天范围切换命中缓存，不重复请求 /api/stats');
+
+      // 趋势卡可见时收到 SSE 变更 → 静默重拉当前范围（契约 §6.4）
+      await page.clickTestId('stats-metric-bathCount');
+      await sleep(200);
+      const bathBeforeStatsSse = await pageStatsSnapshot();
+      const bathValsBeforeSse = statsValuesNode(api7.daily, 'bathCount');
+      assertDeepEqual(
+        bathBeforeStatsSse.valueLabels,
+        bathValsBeforeSse.map((value) => String(value)),
+        '洗澡指标：SSE 前 7 天各点与 API 一致',
+      );
+      const sseStatsSince = page.responses.length;
+      const sseBathForStats = await seedBath();
+      assertEqual(sseBathForStats.status, 201, '趋势卡 SSE 重拉：第二客户端记录洗澡 → 201');
+      const statsRefetch = await page.waitForResponse(
+        (response) => response.method === 'GET' && response.path === '/api/stats' && response.url.includes('days=7'),
+        { since: sseStatsSince, timeout: 8000 },
+      );
+      assertEqual(statsRefetch.status, 200, '趋势卡可见时收到洗澡 SSE → 自动重拉 GET /api/stats?days=7');
+      await sleep(400);
+      const bathAfterStatsSse = await pageStatsSnapshot();
+      assertEqual(
+        bathAfterStatsSse.valueLabels[6],
+        String(bathValsBeforeSse[6] + 1),
+        'SSE 静默重拉后洗澡指标末点（今天）+1',
+      );
+      const api7AfterStatsSse = (await api.stats(7, tzOffset)).data;
+      assertEqual(
+        bathAfterStatsSse.summary,
+        statsSummaryExpectedNode(api7AfterStatsSse.daily, 7, STATS_METRICS[5]),
+        'SSE 静默重拉后洗澡汇总与最新 API 数据一致',
+      );
+      // 清理这条 SSE 数据 → 趋势卡再次静默重拉并恢复
+      const sseDeleteSince = page.responses.length;
+      const sseBathDelete = await api.deleteEvent(sseBathForStats.data.event.id);
+      assertEqual(sseBathDelete.status, 204, '清理趋势 SSE 测试洗澡记录 → 204');
+      await page.waitForResponse(
+        (response) => response.method === 'GET' && response.path === '/api/stats' && response.url.includes('days=7'),
+        { since: sseDeleteSince, timeout: 8000 },
+      );
+      await sleep(400);
+      const bathAfterStatsDelete = await pageStatsSnapshot();
+      assertEqual(
+        bathAfterStatsDelete.valueLabels[6],
+        String(bathValsBeforeSse[6]),
+        '删除洗澡后趋势卡 7 天末点静默恢复',
+      );
+
+      // 回到 7 天 / 奶量，截图（浅色 + 深色）
+      await page.clickTestId('stats-range-7');
+      await waitStatsPoints(7);
+      await page.clickTestId('stats-metric-totalMl');
+      await sleep(200);
+      await page.emulateMedia({ colorScheme: 'light' });
+      await sleep(250);
+      const lightChart = await page.evaluate(`(() => {
+        const chart = document.querySelector('[data-testid="stats-chart"]');
+        const line = chart.querySelector('.stats-line');
+        const label = chart.querySelector('.stats-axis-label');
+        return { lineStroke: getComputedStyle(line).stroke, labelFill: getComputedStyle(label).fill, bodyBg: getComputedStyle(document.body).backgroundColor };
+      })()`);
+      await page.screenshotOf(sel('stats-card'), 'stats-390.png');
+      await page.emulateMedia({ colorScheme: 'dark' });
+      await sleep(350);
+      const darkChart = await page.evaluate(`(() => {
+        const chart = document.querySelector('[data-testid="stats-chart"]');
+        const line = chart.querySelector('.stats-line');
+        const label = chart.querySelector('.stats-axis-label');
+        return { lineStroke: getComputedStyle(line).stroke, labelFill: getComputedStyle(label).fill, bodyBg: getComputedStyle(document.body).backgroundColor };
+      })()`);
+      assert(lightChart.bodyBg !== darkChart.bodyBg, '深色模式背景色切换', `${lightChart.bodyBg} → ${darkChart.bodyBg}`);
+      assert(lightChart.lineStroke !== darkChart.lineStroke, '深色模式趋势折线颜色随主题切换', `${lightChart.lineStroke} → ${darkChart.lineStroke}`);
+      assert(lightChart.labelFill !== darkChart.labelFill, '深色模式坐标轴标签颜色随主题切换', `${lightChart.labelFill} → ${darkChart.labelFill}`);
+      await page.screenshotOf(sel('stats-card'), 'stats-dark-390.png');
+      await page.emulateMedia({ colorScheme: 'light' });
+      await sleep(250);
+
+      // 响应式：320 / 390 / 900 无横向滚动，SVG 宽度随容器自适应
+      for (const [viewport, label] of [
+        [VIEWPORT_NARROW, '320×640'],
+        [VIEWPORT_MOBILE, '390×844'],
+        [VIEWPORT_DESKTOP, '900×900'],
+      ]) {
+        await page.setViewport(viewport);
+        await sleep(350);
+        const metrics = await page.evaluate(`(() => {
+          const chart = document.querySelector('[data-testid="stats-chart"]');
+          const svg = chart.querySelector('svg');
+          const card = document.querySelector('[data-testid="stats-card"]');
+          const cardRect = card.getBoundingClientRect();
+          const chartRect = chart.getBoundingClientRect();
+          const metricRects = [...document.querySelectorAll('.stats-metric')].map((el) => {
+            const r = el.getBoundingClientRect();
+            return { left: r.left, right: r.right };
+          });
+          return {
+            innerWidth: window.innerWidth,
+            docScrollWidth: document.documentElement.scrollWidth,
+            bodyScrollWidth: document.body.scrollWidth,
+            chartWidth: chart.clientWidth,
+            svgWidth: Number(svg.getAttribute('width')),
+            cardRight: cardRect.right,
+            chartRight: chartRect.right,
+            metricOverflow: metricRects.filter((rect) => rect.left < -0.5 || rect.right > window.innerWidth + 0.5).length,
+          };
+        })()`);
+        assert(
+          metrics.docScrollWidth <= metrics.innerWidth && metrics.bodyScrollWidth <= metrics.innerWidth,
+          `${label}：趋势卡存在时页面无横向滚动`,
+          `doc=${metrics.docScrollWidth} body=${metrics.bodyScrollWidth} ≤ ${metrics.innerWidth}`,
+        );
+        assertEqual(metrics.svgWidth, Math.max(236, Math.round(metrics.chartWidth)), `${label}：SVG 宽度随容器自适应`);
+        assert(metrics.chartRight <= metrics.innerWidth + 0.5, `${label}：趋势图位于视口内`, `chartRight=${Math.round(metrics.chartRight)} / ${metrics.innerWidth}`);
+        assertEqual(metrics.metricOverflow, 0, `${label}：6 个指标 chips 均不溢出视口`);
+      }
+      await page.setViewport(VIEWPORT_MOBILE);
+      await sleep(250);
+      await page.evaluate(`document.querySelector('[data-testid="stats-card"]').scrollIntoView({ block: 'center' })`);
+      await sleep(250);
+
+      // 空状态：清库 + 手动刷新 → 「最近 N 天还没有数据」，仍画 0 基线
+      const clearedForEmpty = await deleteAllEvents();
+      assertEqual(clearedForEmpty.deleted, clearedForEmpty.total, '清空趋势数据（验证空状态）');
+      const refreshSince = page.responses.length;
+      await page.clickTestId('refresh');
+      await page.waitForResponse((response) => response.method === 'GET' && response.path === '/api/state', { since: refreshSince });
+      const empty7 = await page.waitForText(sel('stats-chart'), '最近 7 天还没有数据', {
+        timeout: 10_000,
+        desc: '空数据趋势卡提示',
+      });
+      assertIncludes(empty7, '最近 7 天还没有数据', '全 0 时显示「最近 7 天还没有数据」');
+      const emptySnap = await pageStatsSnapshot();
+      assertEqual(emptySnap.circles, 7, '空数据仍画 7 天 0 基线（7 个数据点）');
+      assertDeepEqual(emptySnap.valueLabels, ['0', '0', '0', '0', '0', '0', '0'], '空数据 7 天每个点数值标签为 0');
+      assertEqual(
+        emptySnap.summary,
+        statsSummaryExpectedNode(api7.daily.map((item) => ({ ...item, totalMl: 0 })), 7, STATS_METRICS[0]),
+        '空数据汇总显示 7 天合计 0 ml / 日均 0 ml / 最高 0 ml',
+      );
+      await page.clickTestId('stats-range-30');
+      await waitStatsPoints(30);
+      const empty30 = await page.waitForText(sel('stats-chart'), '最近 30 天还没有数据', {
+        timeout: 8000,
+        desc: '空数据 30 天视图提示',
+      });
+      assertIncludes(empty30, '最近 30 天还没有数据', '空数据切 30 天显示「最近 30 天还没有数据」');
+      await page.clickTestId('stats-range-7');
+      await waitStatsPoints(7);
+    });
+
     /* ------------------------------------------------ G19 控制台 / 网络 / 静态资源 */
     await runGroup('G19', '控制台错误 / 未捕获异常 / 4xx-5xx / 静态资源 / CORS 预检', async () => {
       assertEqual(page.consoleErrors.length, 0, '页面 console.error 为空（预期内故障注入除外）', page.consoleErrors.map((item) => item.text).join(' | ') || '无');
@@ -2788,6 +3784,9 @@ async function main() {
         'empty-390.png': [780, 1688],
         'multi-select-390.png': [780, 1688],
         'cross-origin-390.png': [780, 1688],
+        'stats-390.png': [780, 1688],
+        'stats-dark-390.png': [780, 1688],
+        'bath-390.png': [780, 1688],
       };
       for (const name of shotNames) {
         const file = path.join(SHOT_DIR, name);
@@ -2941,6 +3940,18 @@ function printSummary() {
   for (const shot of screenshots) {
     console.log(`  📸 docs/screenshots/${shot.name}  ${shot.width}×${shot.height}  ${(shot.bytes / 1024).toFixed(1)}KB`);
   }
+  // 断言明细指纹：只含 group / 断言名 / 结果，不含耗时、端口、时间等易变证据，
+  // 用于验证「连跑 2 次明细一致」；E2E_MANIFEST=1 时额外打印逐条清单便于 diff。
+  const manifest = groups.flatMap((group) =>
+    group.rows.map((row) => `${group.id}|${row.name}|${row.ok ? 'PASS' : 'FAIL'}`),
+  );
+  const fingerprint = createHash('sha256').update(manifest.join('\n')).digest('hex');
+  if (process.env.E2E_MANIFEST === '1') {
+    console.log('\n  断言明细清单（group|name|result）：');
+    for (const line of manifest) console.log(`  ${line}`);
+  }
+  console.log(`\n  明细指纹 sha256=${fingerprint}`);
+  console.log(`  明细条数 ${manifest.length}`);
   console.log(`\n  总体结果：${failures.length === 0 ? 'PASS（exit 0）' : `FAIL ${failures.length} 项（exit 1）`}`);
   console.log('══════════════════════════════════════════════════════════════\n');
   process.exitCode = failures.length === 0 ? 0 : 1;

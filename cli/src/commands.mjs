@@ -16,6 +16,7 @@ import { mkdir, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 
 import {
+  buildBathRequest,
   buildDiaperRequest,
   buildFeedRequest,
   ensureNoPositionals,
@@ -50,18 +51,35 @@ export async function statusCommand(parsed, ctx) {
 }
 
 // ---------------------------------------------------------------------------
-// feed / pee / poop / diaper
+// feed / pee / poop / diaper / bath
 // ---------------------------------------------------------------------------
 
 export async function recordCommand(parsed, ctx) {
   const isFeed = parsed.command === 'feed';
-  const body = isFeed ? buildFeedRequest(parsed, ctx.now()) : buildDiaperRequest(parsed, ctx.now());
-  const event = isFeed ? await ctx.client.createFeeding(body) : await ctx.client.createDiaper(body);
+  const isBath = parsed.command === 'bath';
+  const body = isFeed
+    ? buildFeedRequest(parsed, ctx.now())
+    : isBath
+      ? buildBathRequest(parsed, ctx.now())
+      : buildDiaperRequest(parsed, ctx.now());
+  const event = isFeed
+    ? await ctx.client.createFeeding(body)
+    : isBath
+      ? await ctx.client.createBath(body)
+      : await ctx.client.createDiaper(body);
   if (ctx.json) {
     printJson(ctx.io, { event });
     return;
   }
-  writeLine(ctx.io, renderRecordResult(event, { now: ctx.now(), styler: ctx.styler }));
+  writeLine(
+    ctx.io,
+    renderRecordResult(event, {
+      now: ctx.now(),
+      styler: ctx.styler,
+      // 洗澡输出保持契约里的紧凑格式：「✅ 已记录 洗澡 · HH:MM」（id 见 --json / log）
+      showId: !isBath,
+    }),
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -271,6 +289,7 @@ const HANDLERS = {
   pee: recordCommand,
   poop: recordCommand,
   diaper: recordCommand,
+  bath: recordCommand,
   log: logCommand,
   today: todayCommand,
   undo: undoCommand,

@@ -1,5 +1,5 @@
 /**
- * 奶记 · HTTP API 服务（v2，前后端分离）
+ * 奶记 · HTTP API 服务（v3，前后端分离）
  *
  * - 零第三方依赖：node:http + node:sqlite
  * - 纯 JSON API；可选托管 web/ 静态文件（SERVE_WEB=1，方便家庭单机部署）
@@ -16,6 +16,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import { openDb } from './db.js';
 import { buildState } from './state.js';
+import { buildDailyStats, DEFAULT_STATS_DAYS, MIN_STATS_DAYS, MAX_STATS_DAYS } from './stats.js';
 import {
   FEED_TYPE_LABELS,
   DIAPER_KIND_LABELS,
@@ -370,18 +371,39 @@ function handleHealth(_req, res) {
   sendJson(res, 200, { ok: true });
 }
 
-function handleState(_req, res, url, store, nowMs) {
+/** 解析并校验 tzOffset 查询参数（state / stats 共用） */
+function parseTzOffset(url) {
   const raw = url.searchParams.get('tzOffset');
-  let tzOffset = null;
-  if (raw !== null) {
-    if (!/^-?\d{1,4}$/.test(raw)) return sendError(res, 400, 'invalid_tz_offset', 'tzOffset 必须是整数分钟');
-    const parsed = Number(raw);
-    if (!isValidTzOffset(parsed)) {
-      return sendError(res, 400, 'invalid_tz_offset', 'tzOffset 必须在 -840 到 840 之间');
-    }
-    tzOffset = parsed;
+  if (raw === null) return { ok: true, value: null };
+  if (!/^-?\d{1,4}$/.test(raw)) return fail(400, 'invalid_tz_offset', 'tzOffset 必须是整数分钟');
+  const parsed = Number(raw);
+  if (!isValidTzOffset(parsed)) {
+    return fail(400, 'invalid_tz_offset', 'tzOffset 必须在 -840 到 840 之间');
   }
-  sendJson(res, 200, buildState(store, nowMs, tzOffset));
+  return { ok: true, value: parsed };
+}
+
+function handleState(_req, res, url, store, nowMs) {
+  const tz = parseTzOffset(url);
+  if (!tz.ok) return sendError(res, tz.status, tz.code, tz.message);
+  sendJson(res, 200, buildState(store, nowMs, tz.value));
+}
+
+function handleStats(_req, res, url, store, nowMs) {
+  const tz = parseTzOffset(url);
+  if (!tz.ok) return sendError(res, tz.status, tz.code, tz.message);
+
+  let days = DEFAULT_STATS_DAYS;
+  const rawDays = url.searchParams.get('days');
+  if (rawDays !== null) {
+    if (!/^\d{1,3}$/.test(rawDays)) return sendError(res, 400, 'invalid_days', 'days 必须是整数');
+    days = Number(rawDays);
+    if (days < MIN_STATS_DAYS || days > MAX_STATS_DAYS) {
+      return sendError(res, 400, 'invalid_days', `days 必须在 ${MIN_STATS_DAYS} 到 ${MAX_STATS_DAYS} 之间`);
+    }
+  }
+
+  sendJson(res, 200, buildDailyStats(store, nowMs, days, tz.value));
 }
 
 function handleListEvents(_req, res, url, store) {
@@ -466,6 +488,24 @@ async function handleCreateDiaper(req, res, store, nowMs, hub) {
   hub?.broadcast('diaper', { event });
 }
 
+async function handleCreateBath(req, res, store, nowMs, hub) {
+  const body = await readJsonBody(req);
+  if (!body.ok) return sendError(res, body.status, body.code, body.message);
+
+  const happenedAt = validateHappenedAt(body.value.happenedAt, nowMs);
+  if (!happenedAt.ok) return sendError(res, happenedAt.status, happenedAt.code, happenedAt.message);
+  const note = validateNote(body.value.note);
+  if (!note.ok) return sendError(res, note.status, note.code, note.message);
+
+  const event = store.createBathEvent({
+    note: note.value,
+    happenedAt: happenedAt.value,
+    createdAt: nowMs,
+  });
+  sendJson(res, 201, { event });
+  hub?.broadcast('bath', { event });
+}
+
 function handleDeleteEvent(res, id, store, hub) {
   if (!store.deleteEvent(id)) return sendError(res, 404, 'not_found', '记录不存在');
   res.writeHead(204, { 'Cache-Control': 'no-store' });
@@ -499,13 +539,16 @@ function handleExportCsv(res, store, nowMs) {
   const lines = ['时间,类别,项目,奶量(ml),备注'];
   for (const event of store.allEvents()) {
     const isFeed = event.kind === 'feed';
+    const isBath = event.kind === 'bath';
     const project = isFeed
       ? (event.feedTypes ?? []).map((type) => FEED_TYPE_LABELS[type] ?? type).join(' + ')
-      : (DIAPER_KIND_LABELS[event.diaperKind] ?? '');
+      : isBath
+        ? '洗澡'
+        : (DIAPER_KIND_LABELS[event.diaperKind] ?? '');
     lines.push(
       [
         formatLocalDateTime(event.happenedAt),
-        isFeed ? '喂奶' : '大小便',
+        isFeed ? '喂奶' : isBath ? '洗澡' : '大小便',
         project,
         isFeed && event.amountMl !== null ? event.amountMl : '',
         event.note,
@@ -621,6 +664,7 @@ export function createApp({
 
       if (pathname === '/api/health' && req.method === 'GET') return handleHealth(req, res);
       if (pathname === '/api/state' && req.method === 'GET') return handleState(req, res, url, store, nowMs);
+      if (pathname === '/api/stats' && req.method === 'GET') return handleStats(req, res, url, store, nowMs);
       if (pathname === '/api/events' && req.method === 'GET') return handleListEvents(req, res, url, store);
       if (pathname === '/api/events/stream' && req.method === 'GET') return hub.add(req, res);
       if (pathname === '/api/feedings' && req.method === 'POST') {
@@ -628,6 +672,9 @@ export function createApp({
       }
       if (pathname === '/api/diapers' && req.method === 'POST') {
         return await handleCreateDiaper(req, res, store, nowMs, hub);
+      }
+      if (pathname === '/api/baths' && req.method === 'POST') {
+        return await handleCreateBath(req, res, store, nowMs, hub);
       }
       if (pathname === '/api/export.csv' && req.method === 'GET') return handleExportCsv(res, store, nowMs);
 

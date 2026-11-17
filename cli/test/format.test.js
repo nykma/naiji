@@ -113,7 +113,7 @@ test('sortFeedTypes / feedTypesLabel：按规范顺序去重', () => {
   assert.equal(feedTypesLabel([]), '');
 });
 
-test('eventTitle：多标签 / 亲喂 / 大小便 / v1 兼容', () => {
+test('eventTitle：多标签 / 亲喂 / 大小便 / 洗澡 / v1 兼容', () => {
   const now = Date.now();
   assert.equal(
     eventTitle({ kind: 'feed', feedTypes: ['formula', 'breast_milk'], amountMl: 120, happenedAt: now }),
@@ -129,9 +129,20 @@ test('eventTitle：多标签 / 亲喂 / 大小便 / v1 兼容', () => {
   );
   assert.equal(eventTitle({ kind: 'feed', feedType: 'formula', amountMl: 90 }), '奶粉 90 ml');
   assert.equal(eventTitle({ kind: 'diaper', diaperKind: 'mixed' }), '大小便');
+  assert.equal(
+    eventTitle({
+      kind: 'bath',
+      feedTypes: null,
+      amountMl: null,
+      diaperKind: null,
+      note: '洗香香',
+      happenedAt: now,
+    }),
+    '洗澡',
+  );
 });
 
-test('eventIcon：含奶粉优先奶瓶，只有母乳用奶杯，亲喂用抱娃', () => {
+test('eventIcon：含奶粉优先奶瓶，只有母乳用奶杯，亲喂用抱娃；洗澡用浴缸', () => {
   assert.equal(eventIcon({ kind: 'feed', feedTypes: ['formula', 'breast_direct'] }), '🍼');
   assert.equal(eventIcon({ kind: 'feed', feedTypes: ['breast_milk', 'breast_direct'] }), '🥛');
   assert.equal(eventIcon({ kind: 'feed', feedTypes: ['breast_direct'] }), '🤱');
@@ -139,9 +150,10 @@ test('eventIcon：含奶粉优先奶瓶，只有母乳用奶杯，亲喂用抱�
   assert.equal(eventIcon({ kind: 'diaper', diaperKind: 'pee' }), '💧');
   assert.equal(eventIcon({ kind: 'diaper', diaperKind: 'poop' }), '💩');
   assert.equal(eventIcon({ kind: 'diaper', diaperKind: 'mixed' }), '🚼');
+  assert.equal(eventIcon({ kind: 'bath', diaperKind: null }), '🛁');
 });
 
-test('formatTodaySummary：与契约 §7.3 的格式一致', () => {
+test('formatTodaySummary：与契约 §7.3 的格式一致（末尾含洗澡次数）', () => {
   assert.equal(
     formatTodaySummary({
       feedCount: 4,
@@ -149,12 +161,13 @@ test('formatTodaySummary：与契约 §7.3 的格式一致', () => {
       breastDirectCount: 1,
       peeCount: 2,
       poopCount: 1,
+      bathCount: 1,
     }),
-    '今日 喂奶 4 次 · 奶量 360 ml · 亲喂 1 次 · 小便 2 · 大便 1',
+    '今日 喂奶 4 次 · 奶量 360 ml · 亲喂 1 次 · 小便 2 · 大便 1 · 洗澡 1 次',
   );
   assert.equal(
     formatTodaySummary({}),
-    '今日 喂奶 0 次 · 奶量 0 ml · 亲喂 0 次 · 小便 0 · 大便 0',
+    '今日 喂奶 0 次 · 奶量 0 ml · 亲喂 0 次 · 小便 0 · 大便 0 · 洗澡 0 次',
   );
 });
 

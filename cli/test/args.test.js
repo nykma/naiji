@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import {
+  buildBathRequest,
   buildDiaperRequest,
   buildFeedRequest,
   ensureNoPositionals,
@@ -56,6 +57,8 @@ test('命令别名', () => {
     [['p'], 'pee'],
     [['o'], 'poop'],
     [['d', 'poop'], 'diaper'],
+    [['bath'], 'bath'],
+    [['b'], 'bath'],
     [['l'], 'log'],
     [['u'], 'undo'],
     [['c'], 'config'],
@@ -114,6 +117,8 @@ test('命令级选项校验：命令不支持的选项报错', () => {
   assertUsageError(() => parse(['status', '--note', 'x']), /不支持选项/);
   assertUsageError(() => parse(['log', '--ago', '5']), /不支持选项/);
   assertUsageError(() => parse(['undo', '--out', 'x']), /不支持选项/);
+  assertUsageError(() => parse(['bath', '--limit', '5']), /不支持选项/);
+  assertUsageError(() => parse(['bath', '--type', 'formula']), /不支持选项/);
 });
 
 test('--help / --version 优先，不校验参数', () => {
@@ -296,6 +301,62 @@ test('buildDiaperRequest：非法类型 / 缺少类型 / 多余参数报用法�
   assertUsageError(() => buildDiaperRequest(parse(['d', 'wet']), NOW), /未知的大小便类型/);
   assertUsageError(() => buildDiaperRequest(parse(['d', 'pee', 'poop']), NOW), /只接受一个类型/);
   assertUsageError(() => buildDiaperRequest(parse(['p', 'extra']), NOW), /不接受参数/);
+});
+
+// ---------------------------------------------------------------------------
+// buildBathRequest
+// ---------------------------------------------------------------------------
+
+test('buildBathRequest：默认不带 happenedAt（由服务端取 now）', () => {
+  assert.deepEqual(buildBathRequest(parse(['bath']), NOW), {});
+  assert.deepEqual(buildBathRequest(parse(['b']), NOW), {});
+  // --json 是全局选项，bath 同样可用
+  assert.equal(parse(['bath', '--json']).options.json, true);
+});
+
+test('buildBathRequest：--note 写入请求体（trim 后为空视为未填）', () => {
+  assert.deepEqual(buildBathRequest(parse(['bath', '--note', '  洗香香  ']), NOW), {
+    note: '洗香香',
+  });
+  assert.deepEqual(buildBathRequest(parse(['bath', '--note', '   ']), NOW), {});
+  assertUsageError(
+    () => buildBathRequest(parse(['bath', '--note', 'x'.repeat(201)]), NOW),
+    /备注不能超过/,
+  );
+});
+
+test('buildBathRequest：--ago 回溯到 now - N 分钟', () => {
+  assert.deepEqual(buildBathRequest(parse(['bath', '--ago', '30']), NOW), {
+    happenedAt: NOW - 30 * MINUTE,
+  });
+  assert.deepEqual(buildBathRequest(parse(['b', '--ago', '0']), NOW), { happenedAt: NOW });
+});
+
+test('buildBathRequest：--at HH:MM / 绝对时间', () => {
+  assert.deepEqual(buildBathRequest(parse(['bath', '--at', '08:30']), NOW), {
+    happenedAt: new Date(2026, 10, 13, 8, 30, 0, 0).getTime(),
+  });
+  assert.deepEqual(buildBathRequest(parse(['bath', '--at', '2026-01-10 20:30']), NOW), {
+    happenedAt: new Date(2026, 0, 10, 20, 30, 0, 0).getTime(),
+  });
+});
+
+test('buildBathRequest：--note + --ago 组合', () => {
+  assert.deepEqual(buildBathRequest(parse(['b', '--note', '洗香香', '--ago', '30']), NOW), {
+    note: '洗香香',
+    happenedAt: NOW - 30 * MINUTE,
+  });
+});
+
+test('buildBathRequest：位置参数 / 非法时间 / 未来时间报用法错误', () => {
+  assertUsageError(() => buildBathRequest(parse(['bath', 'extra']), NOW), /不接受参数/);
+  assertUsageError(() => buildBathRequest(parse(['bath', '--ago', 'abc']), NOW), /--ago/);
+  assertUsageError(() => buildBathRequest(parse(['bath', '--at', '25:00']), NOW), /--at/);
+  assertUsageError(() => buildBathRequest(parse(['bath', '--at', '23:59']), NOW), /在未来/);
+  assertUsageError(
+    () => buildBathRequest(parse(['bath', '--ago', '30', '--at', '08:30']), NOW),
+    /不能同时使用/,
+  );
 });
 
 // ---------------------------------------------------------------------------

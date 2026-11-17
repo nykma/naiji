@@ -1,5 +1,5 @@
 /**
- * web/lib/format.js v2 纯函数测试（浏览器 / Node 共享模块）。
+ * web/lib/format.js v3 纯函数测试（浏览器 / Node 共享模块）。
  *
  * 时间类断言全部用本地 Date 构造器生成时间戳，不假设运行环境时区。
  */
@@ -219,6 +219,16 @@ describe('format · eventTitle', () => {
     assert.equal(eventTitle({ kind: 'diaper', diaperKind: 'mixed' }), '大小便');
   });
 
+  test('洗澡事件（v3）→ 洗澡', () => {
+    assert.equal(eventTitle({ kind: 'bath' }), '洗澡');
+    assert.equal(
+      eventTitle({ kind: 'bath', feedTypes: null, amountMl: null, diaperKind: null }),
+      '洗澡',
+    );
+    assert.equal(eventTitle({ kind: 'bath', note: '洗香香' }), '洗澡', '备注不进入标题');
+    assert.equal(eventTitle({ kind: 'bath', feedTypes: ['formula'], amountMl: 120 }), '洗澡', '残留业务字段不影响');
+  });
+
   test('v1 单值 feedType 兼容回退', () => {
     assert.equal(eventTitle({ kind: 'feed', feedType: 'formula', amountMl: 120 }), '奶粉 120 ml');
     assert.equal(eventTitle({ kind: 'feed', feedType: 'breast_milk', amountMl: 90 }), '母乳（瓶喂） 90 ml');
@@ -253,5 +263,11 @@ describe('format · eventIcon', () => {
     assert.equal(eventIcon({ kind: 'diaper', diaperKind: 'mixed' }), '🚼');
     assert.equal(eventIcon(null), '');
     assert.equal(eventIcon(undefined), '');
+  });
+
+  test('洗澡图标（v3）→ 🛁', () => {
+    assert.equal(eventIcon({ kind: 'bath' }), '🛁');
+    assert.equal(eventIcon({ kind: 'bath', note: '洗香香' }), '🛁');
+    assert.equal(eventIcon({ kind: 'bath', diaperKind: null }), '🛁');
   });
 });

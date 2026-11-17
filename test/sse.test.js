@@ -1,8 +1,8 @@
 /**
  * SSE 实时推送（多端同步）测试
  *
- * 覆盖：事件流响应头 / 初始帧、记录与删除广播、多客户端同时收到、
- * 心跳帧、关闭应用时结束连接。
+ * 覆盖：事件流响应头 / 初始帧、记录（feed / diaper / bath）与删除广播、
+ * 多客户端同时收到、心跳帧、关闭应用时结束连接。
  */
 
 import test from 'node:test';
@@ -153,6 +153,32 @@ test('记录大小便后广播 diaper 事件', async (t) => {
   const { status } = await jsonFetch(base, 'POST', '/api/diapers', { diaperKind: 'poop' });
   assert.equal(status, 201);
   await client.waitFor(/"type":"diaper".*"diaperKind":"poop"/);
+});
+
+test('记录洗澡后广播 bath 事件（完整 Event 形状）', async (t) => {
+  const { port, base } = await startApp(t);
+  const client = await connectSse(port);
+  t.after(() => client.close());
+  await client.waitFor(/: connected/);
+
+  const { status, payload } = await jsonFetch(base, 'POST', '/api/baths', {
+    note: '洗香香',
+    happenedAt: Date.now() - 60_000,
+  });
+  assert.equal(status, 201);
+  assert.equal(payload.event.kind, 'bath');
+
+  await client.waitFor(new RegExp(`"type":"bath".*"id":${payload.event.id}`));
+
+  const frame = client.text.match(/data: (\{"type":"bath"[^\n]*)/);
+  assert.ok(frame, '应收到 bath 广播帧');
+  const change = JSON.parse(frame[1]);
+  assert.equal(change.type, 'bath');
+  assert.deepEqual(change.event, payload.event, '广播的 event 应与 POST 响应一致');
+  assert.equal(change.event.feedTypes, null);
+  assert.equal(change.event.amountMl, null);
+  assert.equal(change.event.diaperKind, null);
+  assert.equal(change.event.note, '洗香香');
 });
 
 test('删除记录后广播 delete 事件', async (t) => {

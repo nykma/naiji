@@ -13,7 +13,7 @@ v2 已拆成前后端分离的三部分，彼此只通过 HTTP API 通信：
 数据存一个 SQLite 文件（默认 `data/baby.db`），复制即备份。手机和 CLI 可以连同一个后端，记录实时同步。
 
 <p align="center">
-  <img src="docs/screenshots/hero-390.png" width="400" alt="奶记手机端主界面：距离上次喂奶实时显示、奶粉/母乳/亲喂多选一键记录、今日汇总与时间线" />
+  <img src="docs/screenshots/hero-390.png" width="400" alt="奶记手机端主界面：距离上次喂奶实时显示、奶粉/母乳/亲喂多选一键记录、洗澡、今日汇总、趋势折线图与时间线" />
 </p>
 
 ## 功能
@@ -22,12 +22,14 @@ v2 已拆成前后端分离的三部分，彼此只通过 HTTP API 通信：
 | --- | --- |
 | 🍼 一键喂奶（多选） | **奶粉 / 母乳（瓶喂）/ 亲喂 可多选**（如「奶粉 + 母乳 120 ml」「亲喂 + 奶粉 60 ml」），选好类型点 30/60/90/120/150/180 ml 立即记录，也可自定义奶量；亲喂无需奶量 |
 | 💧💩 一键大小便 | 小便 / 大便（API 支持「混合」） |
-| ⏱ 距上次喂奶 | 大字实时刷新「3 小时 25 分钟」，另显示上次详情、距上次换尿布时间；**浏览器标签标题**也显示「距上次 X · 奶记」，切标签也能瞥一眼 |
-| 📊 今日汇总 | 喂奶次数、总奶量、亲喂次数、大小便次数 |
+| 🛁 一键洗澡 | 「洗澡」也是独立记录；**洗澡会一并重置「距上次换尿布」计时**（显示为「距上次换尿布/洗澡」） |
+| ⏱ 距上次喂奶 | 大字实时刷新「3 小时 25 分钟」，另显示上次详情、距上次换尿布/洗澡时间；**浏览器标签标题**也显示「距上次 X · 奶记」，切标签也能瞥一眼 |
+| 📈 趋势折线图 | 最近 **7 天 / 30 天**按天统计：奶量、喂奶次数、亲喂、小便、大便、洗澡，SVG 手绘折线（零依赖），带每日数值/合计/日均/最高 |
+| 📊 今日汇总 | 喂奶次数、总奶量、亲喂次数、大小便次数、洗澡次数 |
 | 🕘 时间线 | 按天分组，删除、记录后 5 秒内撤销 |
 | 🔄 多人实时同步 | 家里几个人同时用：谁记录/删除，所有打开的页面**无需刷新**立即同步（SSE 长连接）；顶栏还有手动「刷新」按钮兜底 |
 | 📤 导出 CSV | 带 BOM，Excel 可直接打开不乱码 |
-| 💻 CLI | `naiji` 无参数即看状态；`naiji f 120` 记录；`naiji log` 看历史；支持 `--ago` 回溯补记 |
+| 💻 CLI | `naiji` 无参数即看状态；`naiji f 120` / `naiji p` / `naiji bath` 记录；`naiji log` 看历史；支持 `--ago` 回溯补记 |
 | 🔗 前后端分离 | web 可单独托管，跨源访问 API（已内置 CORS）；手机、电脑 CLI 共用一个后端 |
 
 ## 快速开始
@@ -92,6 +94,7 @@ naiji f --direct          # 只亲喂（无奶量）
 naiji f 120 --ago 30      # 补记 30 分钟前的那次
 naiji f 120 --at "20:30"  # 补记今天 20:30
 naiji p / naiji o         # 小便 / 大便
+naiji bath                # 洗澡（会重置「距上次换尿布/洗澡」计时）
 naiji log -n 20           # 最近 20 条
 naiji today               # 今天的时间线 + 汇总
 naiji undo                # 删掉最近一条（TTY 下会确认）
@@ -138,7 +141,7 @@ node scripts/serve-web.mjs --port 8080 --api http://192.168.1.23:3000
 
 - 所有记录都在一个 SQLite 文件里（默认 `data/baby.db`），**复制该文件即完整备份**（建议停服后复制，或连同 `-wal`/`-shm` 一起）。
 - 也可以从网页右上角「导出 CSV」或 `naiji export` 拿人类可读备份。
-- **v1 → v2 自动迁移**：v2 首次打开旧库时会把 `feed_type` 单值自动转成 `feedTypes` 数组（`user_version` 置 2），历史记录与时间不变，无需手动操作。
+- **旧库自动迁移**：v1（单值 `feed_type`）→ v3 自动转成 `feedTypes` 数组；v2 → v3 自动放宽事件类型以支持「洗澡」（`user_version` 置 3）。历史记录、时间与 id 都不变，无需手动操作。
 - `data/` 已 gitignore。
 
 ## 开发
@@ -192,9 +195,11 @@ baby-milk-tracker/
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | `GET` | `/api/health` | 健康检查 |
-| `GET` | `/api/state?tzOffset=-480` | 首页聚合：上次喂奶 / 上次大小便 / 今日汇总 / 最近 30 条 |
+| `GET` | `/api/state?tzOffset=-480` | 首页聚合：上次喂奶 / 上次大小便 / 上次洗澡 / 今日汇总 / 最近 30 条 |
 | `POST` | `/api/feedings` | 记录喂奶 `{feedTypes: ["formula","breast_milk"], amountMl: 120}` |
 | `POST` | `/api/diapers` | 记录大小便 `{diaperKind: "pee"\|"poop"\|"mixed"}` |
+| `POST` | `/api/baths` | 记录洗澡 `{note?, happenedAt?}` |
+| `GET` | `/api/stats?days=7&tzOffset=-480` | 最近 N 天（1–90，默认 7）按天聚合，用于趋势图 |
 | `GET` | `/api/events?limit=50&before=&beforeId=` | 历史记录（复合游标分页） |
 | `GET` | `/api/events/stream` | **SSE 实时推送**：任何一端新增/删除记录后广播给所有页面 |
 | `DELETE` | `/api/events/:id` | 删除一条记录 |
@@ -202,11 +207,13 @@ baby-milk-tracker/
 
 ## 更多截图
 
-| 手机 · 多选记录（奶粉 + 母乳） | 手机 · 深色 | 前后端分离 · 跨源部署 |
+| 手机 · 多选记录 | 手机 · 趋势折线图 | 手机 · 深色模式 |
 | --- | --- | --- |
-| ![多选记录](docs/screenshots/multi-select-390.png) | ![深色模式](docs/screenshots/dark-390.png) | ![跨源部署](docs/screenshots/cross-origin-390.png) |
+| ![多选记录](docs/screenshots/multi-select-390.png) | ![趋势折线图](docs/screenshots/stats-390.png) | ![深色模式](docs/screenshots/dark-390.png) |
+| **前后端分离 · 跨源部署** | **洗澡记录** | **空状态** |
+| ![跨源部署](docs/screenshots/cross-origin-390.png) | ![洗澡记录](docs/screenshots/bath-390.png) | ![空状态](docs/screenshots/empty-390.png) |
 
-更多截图见 [docs/screenshots/](docs/screenshots/)，浏览器 + CLI + 跨源的端到端验收（644 条断言）详见 [docs/qa-report.md](docs/qa-report.md)。
+更多截图见 [docs/screenshots/](docs/screenshots/)，浏览器 + CLI + 跨源/SSE 的端到端验收（950 条断言）详见 [docs/qa-report.md](docs/qa-report.md)。
 
 ## 常驻运行（可选）
 

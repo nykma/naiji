@@ -1,5 +1,5 @@
 /**
- * HTTP API 集成测试（v2）。
+ * HTTP API 集成测试（v3）。
  *
  * 每个用例用 fs.mkdtemp 临时目录 + :memory-free 文件 DB + listen(0) 随机端口，
  * 注入固定 now，结束后 close + 清理；不写仓库 data/，可并行重复运行。
@@ -64,6 +64,7 @@ function postJson(base, pathname, body, extraHeaders = {}) {
 
 const postFeeding = (base, body, headers) => postJson(base, '/api/feedings', body, headers);
 const postDiaper = (base, body, headers) => postJson(base, '/api/diapers', body, headers);
+const postBath = (base, body, headers) => postJson(base, '/api/baths', body, headers);
 const getJson = (base, pathname) => fetch(`${base}${pathname}`);
 
 /** 断言错误响应：状态码 + 错误码 + 非空中文 message */
@@ -103,6 +104,19 @@ function expectedDiaperEvent({ id, diaperKind, note = null, happenedAt }) {
   };
 }
 
+function expectedBathEvent({ id, note = null, happenedAt }) {
+  return {
+    id,
+    kind: 'bath',
+    feedTypes: null,
+    amountMl: null,
+    diaperKind: null,
+    note,
+    happenedAt,
+    createdAt: NOW,
+  };
+}
+
 /** 直接通过 Store 造数据（用于构造 API 校验不允许的边界时间/批量数据） */
 function seedFeed(store, happenedAt, feedTypes, amountMl = null, note = null) {
   return store.createFeedEvent({ feedTypes, amountMl, note, happenedAt, createdAt: NOW });
@@ -110,6 +124,10 @@ function seedFeed(store, happenedAt, feedTypes, amountMl = null, note = null) {
 
 function seedDiaper(store, happenedAt, diaperKind, note = null) {
   return store.createDiaperEvent({ diaperKind, note, happenedAt, createdAt: NOW });
+}
+
+function seedBath(store, happenedAt, note = null) {
+  return store.createBathEvent({ note, happenedAt, createdAt: NOW });
 }
 
 // ---------------------------------------------------------------------------
@@ -512,6 +530,152 @@ describe('POST /api/diapers', () => {
 });
 
 // ---------------------------------------------------------------------------
+// POST /api/baths（v3）
+// ---------------------------------------------------------------------------
+
+describe('POST /api/baths', () => {
+  test('成功：201 + Event 形状（业务字段全 null）+ note trim + happenedAt 原样 + createdAt=now', async (t) => {
+    const { url } = await startApp(t);
+    const happenedAt = NOW - 2 * HOUR;
+    const res = await postBath(url, { happenedAt, note: '  洗香香  ' });
+    assert.equal(res.status, 201);
+    assert.match(res.headers.get('content-type') ?? '', /^application\/json/);
+    const body = await res.json();
+    assert.deepEqual(body.event, expectedBathEvent({ id: body.event.id, note: '洗香香', happenedAt }));
+    assert.equal(body.event.id, 1);
+
+    const events = await (await getJson(url, '/api/events')).json();
+    assert.deepEqual(events.events, [body.event], 'GET /api/events 应包含 bath 记录');
+  });
+
+  test('省略 happenedAt / note：默认 now / null', async (t) => {
+    const { url } = await startApp(t);
+    const res = await postBath(url, {});
+    assert.equal(res.status, 201);
+    const body = await res.json();
+    assert.deepEqual(body.event, expectedBathEvent({ id: body.event.id, happenedAt: NOW }));
+    assert.equal(body.event.createdAt, NOW);
+  });
+
+  test('note 边界：空串 / 纯空白 → null；trim 后 200 字符接受', async (t) => {
+    const { url } = await startApp(t);
+    const exact = 'x'.repeat(200);
+    const padded = await postBath(url, { note: `  ${exact}  ` });
+    assert.equal(padded.status, 201);
+    assert.equal((await padded.json()).event.note, exact);
+
+    for (const note of ['', '   ', '\t\n ']) {
+      const res = await postBath(url, { note });
+      assert.equal(res.status, 201, `note=${JSON.stringify(note)} 应成功`);
+      assert.equal((await res.json()).event.note, null);
+    }
+  });
+
+  test('happenedAt 边界：2000-01-01 与 now+5min 接受', async (t) => {
+    const { url } = await startApp(t);
+    const min = Date.UTC(2000, 0, 1);
+    const maxFuture = NOW + 5 * MINUTE;
+    assert.equal((await postBath(url, { happenedAt: min })).status, 201);
+    assert.equal((await postBath(url, { happenedAt: maxFuture })).status, 201);
+  });
+
+  test('额外业务字段被忽略：不会写入 feedTypes/amountMl/diaperKind', async (t) => {
+    const { url } = await startApp(t);
+    const res = await postBath(url, { feedTypes: ['formula'], amountMl: 120, diaperKind: 'pee' });
+    assert.equal(res.status, 201);
+    const { event } = await res.json();
+    assert.equal(event.kind, 'bath');
+    assert.equal(event.feedTypes, null);
+    assert.equal(event.amountMl, null);
+    assert.equal(event.diaperKind, null);
+  });
+
+  test('invalid_happened_at：字符串 / 太早 / 未来超过 5 分钟 / 小数 / 布尔 / 负数', async (t) => {
+    const { url } = await startApp(t);
+    const cases = [
+      ['字符串', '昨天'],
+      ['太早（1999）', Date.UTC(1999, 11, 31, 23, 59, 59)],
+      ['未来 5 分钟 + 1ms', NOW + 5 * MINUTE + 1],
+      ['小数', 1.5],
+      ['布尔', true],
+      ['负数', -1000],
+    ];
+    for (const [name, happenedAt] of cases) {
+      const res = await postBath(url, { happenedAt });
+      const parsed = await res.json();
+      assert.equal(res.status, 400, `${name} 应返回 400`);
+      assert.equal(parsed.error, 'invalid_happened_at', `${name} 错误码不对`);
+    }
+    assert.deepEqual((await (await getJson(url, '/api/events')).json()).events, [], '校验失败不应写入记录');
+  });
+
+  test('invalid_note：201 字符 / 非字符串', async (t) => {
+    const { url } = await startApp(t);
+    const cases = [
+      ['201 字符', 'x'.repeat(201)],
+      ['201 字符（带空格）', `  ${'x'.repeat(201)}  `],
+      ['数字', 123],
+      ['对象', { text: 'hi' }],
+      ['数组', ['hi']],
+    ];
+    for (const [name, note] of cases) {
+      const res = await postBath(url, { note });
+      const parsed = await res.json();
+      assert.equal(res.status, 400, `${name} 应返回 400`);
+      assert.equal(parsed.error, 'invalid_note', `${name} 错误码不对`);
+    }
+  });
+
+  test('invalid_json：空 body / 坏 JSON / 数组 / null / 字符串 / 数字', async (t) => {
+    const { url } = await startApp(t);
+    for (const [name, raw] of [
+      ['空 body', ''],
+      ['空白 body', '   '],
+      ['坏 JSON', '{"note":'],
+      ['数组', '[]'],
+      ['null', 'null'],
+      ['字符串', '"bath"'],
+      ['数字', '42'],
+    ]) {
+      const res = await postBath(url, raw);
+      const parsed = await res.json();
+      assert.equal(res.status, 400, `${name} 应返回 400`);
+      assert.equal(parsed.error, 'invalid_json', `${name} 错误码不对`);
+    }
+  });
+
+  test('415：非 application/json / 缺 Content-Type / 表单', async (t) => {
+    const { url } = await startApp(t);
+    const textPlain = await fetch(`${url}/api/baths`, {
+      method: 'POST',
+      headers: { 'content-type': 'text/plain' },
+      body: JSON.stringify({ note: 'hi' }),
+    });
+    await assertError(textPlain, 415, 'unsupported_media_type');
+
+    const form = await fetch(`${url}/api/baths`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/x-www-form-urlencoded' },
+      body: 'note=hi',
+    });
+    await assertError(form, 415, 'unsupported_media_type');
+
+    const noHeader = await fetch(`${url}/api/baths`, {
+      method: 'POST',
+      body: JSON.stringify({ note: 'hi' }),
+    });
+    await assertError(noHeader, 415, 'unsupported_media_type');
+  });
+
+  test('413：请求体超过 64KB', async (t) => {
+    const { url } = await startApp(t);
+    const big = JSON.stringify({ note: 'x'.repeat(70 * 1024) });
+    assert.ok(Buffer.byteLength(big) > 64 * 1024);
+    await assertError(await postBath(url, big), 413, 'payload_too_large');
+  });
+});
+
+// ---------------------------------------------------------------------------
 // GET /api/state
 // ---------------------------------------------------------------------------
 
@@ -534,9 +698,11 @@ describe('GET /api/state', () => {
       peeCount: 0,
       poopCount: 0,
       mixedCount: 0,
+      bathCount: 0,
     });
     assert.equal(state.lastFeeding, null);
     assert.equal(state.lastDiaper, null);
+    assert.equal(state.lastBath, null);
     assert.deepEqual(state.recent, []);
   });
 
@@ -554,6 +720,7 @@ describe('GET /api/state', () => {
     created.push((await (await postDiaper(url, { diaperKind: 'pee', happenedAt: sh(10) })).json()).event);
     created.push((await (await postDiaper(url, { diaperKind: 'mixed', happenedAt: sh(10, 30) })).json()).event);
     created.push((await (await postDiaper(url, { diaperKind: 'poop', happenedAt: sh(11) })).json()).event);
+    created.push((await (await postBath(url, { note: '  洗香香  ', happenedAt: sh(12) })).json()).event);
 
     const state = await (await getJson(url, `/api/state?tzOffset=${TZ_SHANGHAI}`)).json();
     assert.equal(state.now, NOW);
@@ -569,13 +736,26 @@ describe('GET /api/state', () => {
       peeCount: 2,
       poopCount: 2,
       mixedCount: 1,
+      bathCount: 1,
     });
     assert.deepEqual(state.lastFeeding, created[3]);
     assert.deepEqual(state.lastDiaper, created[6]);
-    assert.equal(state.recent.length, 7);
+    assert.deepEqual(state.lastBath, created[7]);
+    assert.equal(state.lastBath.kind, 'bath');
+    assert.equal(state.lastBath.note, '洗香香', 'bath 备注应 trim');
+    assert.equal(state.recent.length, 8);
     assert.deepEqual(
       state.recent.map((event) => event.id),
-      [created[6].id, created[5].id, created[4].id, created[3].id, created[2].id, created[1].id, created[0].id],
+      [
+        created[7].id,
+        created[6].id,
+        created[5].id,
+        created[4].id,
+        created[3].id,
+        created[2].id,
+        created[1].id,
+        created[0].id,
+      ],
     );
   });
 
@@ -646,6 +826,239 @@ describe('GET /api/state', () => {
       const res = await getJson(url, `/api/state?tzOffset=${encodeURIComponent(raw)}`);
       await assertError(res, 400, 'invalid_tz_offset');
     }
+  });
+
+  test('lastDiaper / lastBath 各自返回最近一条，便于前端取较晚者计算「距上次换尿布/洗澡」', async (t) => {
+    const { url, app } = await startApp(t);
+    const sh = (hour, minute = 0) => Date.UTC(2026, 10, 13, hour - 8, minute, 0, 0);
+    // 尿布 10:00 → 洗澡 11:00 → 尿布 12:00
+    const diaper1 = seedDiaper(app.store, sh(10), 'pee');
+    const bath = seedBath(app.store, sh(11), '洗澡');
+    const diaper2 = seedDiaper(app.store, sh(12), 'poop');
+
+    const state = await (await getJson(url, `/api/state?tzOffset=${TZ_SHANGHAI}`)).json();
+    assert.equal(state.lastDiaper.id, diaper2.id);
+    assert.equal(state.lastBath.id, bath.id);
+    // 较晚者（尿布 12:00）晚于洗澡 11:00 —— 语义由前端/CLI 取 max(lastDiaper, lastBath)
+    assert.ok(state.lastDiaper.happenedAt > state.lastBath.happenedAt);
+    assert.equal(state.today.bathCount, 1);
+    assert.ok(state.recent.some((event) => event.id === diaper1.id));
+    assert.ok(state.recent.some((event) => event.id === bath.id && event.kind === 'bath'));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// GET /api/stats（v3 趋势统计）
+// ---------------------------------------------------------------------------
+
+/** 东八区墙上时间 → epoch ms */
+function localSh(y, month, day, hour = 0, minute = 0) {
+  return Date.UTC(y, month - 1, day, hour, minute, 0, 0) + TZ_SHANGHAI * MINUTE;
+}
+
+const EMPTY_DAY = {
+  feedCount: 0,
+  totalMl: 0,
+  formulaCount: 0,
+  breastMilkCount: 0,
+  breastDirectCount: 0,
+  mixedFeedCount: 0,
+  diaperCount: 0,
+  peeCount: 0,
+  poopCount: 0,
+  mixedCount: 0,
+  bathCount: 0,
+};
+
+function emptyDay(date) {
+  return { date, ...EMPTY_DAY };
+}
+
+describe('GET /api/stats', () => {
+  test('默认 days=7：长度 7、日期升序连续、最后一天是今天、无记录补 0、响应结构', async (t) => {
+    const { url } = await startApp(t);
+    const res = await getJson(url, `/api/stats?tzOffset=${TZ_SHANGHAI}`);
+    assert.equal(res.status, 200);
+    assert.match(res.headers.get('content-type') ?? '', /^application\/json/);
+    const stats = await res.json();
+
+    assert.equal(stats.days, 7);
+    assert.equal(stats.daily.length, 7);
+    assert.equal(stats.startDate, '2026-11-07');
+    assert.equal(stats.endDate, '2026-11-13');
+    assert.deepEqual(
+      stats.daily.map((day) => day.date),
+      ['2026-11-07', '2026-11-08', '2026-11-09', '2026-11-10', '2026-11-11', '2026-11-12', '2026-11-13'],
+      '日期应升序且连续',
+    );
+    for (const day of stats.daily) {
+      assert.deepEqual(day, emptyDay(day.date), `无记录的日子 ${day.date} 应全部补 0`);
+    }
+  });
+
+  test('days=1 / 30 / 90：长度、startDate、endDate 正确且日期连续', async (t) => {
+    const { url } = await startApp(t);
+    const cases = [
+      [1, '2026-11-13'],
+      [7, '2026-11-07'],
+      [30, '2026-10-15'],
+      [90, '2026-08-16'],
+    ];
+    for (const [days, expectedStart] of cases) {
+      const res = await getJson(url, `/api/stats?days=${days}&tzOffset=${TZ_SHANGHAI}`);
+      assert.equal(res.status, 200, `days=${days} 应 200`);
+      const stats = await res.json();
+      assert.equal(stats.days, days);
+      assert.equal(stats.daily.length, days);
+      assert.equal(stats.startDate, expectedStart, `days=${days} startDate`);
+      assert.equal(stats.endDate, '2026-11-13', `days=${days} endDate 应为今天`);
+      assert.equal(stats.daily.at(-1).date, '2026-11-13');
+      // 升序且连续（用 UTC 解析日期键，逐日 +1）
+      for (let i = 1; i < stats.daily.length; i += 1) {
+        const prev = Date.parse(`${stats.daily[i - 1].date}T00:00:00Z`);
+        const curr = Date.parse(`${stats.daily[i].date}T00:00:00Z`);
+        assert.equal(curr - prev, DAY, `${stats.daily[i - 1].date} → ${stats.daily[i].date} 应连续 1 天`);
+      }
+    }
+  });
+
+  test('days 非法：0 / 91 / abc / 1.5 / 负数 / 空 / 4 位数字 → 400 invalid_days', async (t) => {
+    const { url } = await startApp(t);
+    for (const raw of ['0', '91', '100', '-1', '1.5', 'abc', '', '7.0', '0007', '1e1']) {
+      const res = await getJson(url, `/api/stats?days=${encodeURIComponent(raw)}&tzOffset=${TZ_SHANGHAI}`);
+      const parsed = await res.json();
+      assert.equal(res.status, 400, `days=${JSON.stringify(raw)} 应 400`);
+      assert.equal(parsed.error, 'invalid_days', `days=${JSON.stringify(raw)} 错误码`);
+    }
+  });
+
+  test('非法 tzOffset → 400 invalid_tz_offset', async (t) => {
+    const { url } = await startApp(t);
+    for (const raw of ['abc', '1.5', '900', '-841', '', ' 480', '+480', 'NaN']) {
+      const res = await getJson(url, `/api/stats?tzOffset=${encodeURIComponent(raw)}`);
+      await assertError(res, 400, 'invalid_tz_offset');
+    }
+  });
+
+  test('tzOffset 影响窗口：0 / -480 / 840 的 endDate 随之变化', async (t) => {
+    const { url } = await startApp(t);
+    // NOW = 2026-11-13T04:00:00Z
+    const cases = [
+      [0, '2026-11-13'],
+      [TZ_SHANGHAI, '2026-11-13'],
+      [840, '2026-11-12'], // UTC−14：本地 2026-11-12 14:00
+      [-840, '2026-11-13'], // UTC+14：本地 2026-11-13 18:00
+    ];
+    for (const [tzOffset, expected] of cases) {
+      const stats = await (await getJson(url, `/api/stats?days=3&tzOffset=${tzOffset}`)).json();
+      assert.equal(stats.endDate, expected, `tzOffset=${tzOffset} endDate`);
+      assert.equal(stats.daily.at(-1).date, expected);
+    }
+  });
+
+  test('按天聚合：feed / diaper / bath 各计数与 totalMl 正确，窗口外记录不计入', async (t) => {
+    const { url, app } = await startApp(t);
+    const DAY12 = localSh(2026, 11, 12, 8, 0);
+    const TODAY = localSh(2026, 11, 13, 8, 0);
+    const OUTSIDE = localSh(2026, 11, 1, 8, 0); // 11-01，超出默认 7 天窗口
+
+    // 11-12：喂奶 1 次（奶粉 120）、小便 1、洗澡 1
+    seedFeed(app.store, DAY12, ['formula'], 120);
+    seedDiaper(app.store, DAY12 + HOUR, 'pee');
+    seedBath(app.store, DAY12 + 2 * HOUR);
+
+    // 今天 11-13：喂奶 2 次（奶粉+亲喂 60 —— mixed；仅亲喂无奶量）、大小便 mixed、洗澡 2 次
+    seedFeed(app.store, TODAY, ['formula', 'breast_direct'], 60);
+    seedFeed(app.store, TODAY + HOUR, ['breast_direct']);
+    seedDiaper(app.store, TODAY + 2 * HOUR, 'mixed');
+    seedBath(app.store, TODAY + 3 * HOUR);
+    seedBath(app.store, TODAY + 4 * HOUR);
+
+    // 窗口外：11-01 的喂奶/洗澡不应出现在 7 天结果中
+    seedFeed(app.store, OUTSIDE, ['formula'], 999);
+    seedBath(app.store, OUTSIDE + HOUR);
+
+    const stats = await (await getJson(url, `/api/stats?days=7&tzOffset=${TZ_SHANGHAI}`)).json();
+    assert.equal(stats.daily.length, 7);
+
+    const day12 = stats.daily.find((day) => day.date === '2026-11-12');
+    assert.deepEqual(day12, {
+      ...emptyDay('2026-11-12'),
+      feedCount: 1,
+      totalMl: 120,
+      formulaCount: 1,
+      diaperCount: 1,
+      peeCount: 1,
+      bathCount: 1,
+    });
+
+    const today = stats.daily.find((day) => day.date === '2026-11-13');
+    assert.deepEqual(today, {
+      ...emptyDay('2026-11-13'),
+      feedCount: 2,
+      totalMl: 60,
+      formulaCount: 1,
+      breastDirectCount: 2,
+      mixedFeedCount: 1,
+      diaperCount: 1,
+      peeCount: 1,
+      poopCount: 1,
+      mixedCount: 1,
+      bathCount: 2,
+    });
+
+    // 窗口外的 11-01 不计入 7 天；扩大到 30 天才出现
+    assert.ok(!stats.daily.some((day) => day.date === '2026-11-01'));
+    const wide = await (await getJson(url, `/api/stats?days=30&tzOffset=${TZ_SHANGHAI}`)).json();
+    const outsideDay = wide.daily.find((day) => day.date === '2026-11-01');
+    assert.equal(outsideDay.feedCount, 1);
+    assert.equal(outsideDay.totalMl, 999);
+    assert.equal(outsideDay.bathCount, 1);
+  });
+
+  test('跨日边界：当天 00:00 与前一天 23:59:59.999 分属相邻两天', async (t) => {
+    const { url, app } = await startApp(t);
+    const dayStart = Date.UTC(2026, 10, 12, 16, 0, 0); // 东八区 2026-11-13 00:00
+    seedFeed(app.store, dayStart - 1, ['formula'], 10); // 11-12 23:59:59.999
+    seedFeed(app.store, dayStart, ['formula'], 20); // 11-13 00:00:00.000
+    seedBath(app.store, dayStart - 1);
+    seedBath(app.store, dayStart);
+    seedDiaper(app.store, dayStart - 1, 'pee');
+    seedDiaper(app.store, dayStart, 'poop');
+
+    const stats = await (await getJson(url, `/api/stats?days=2&tzOffset=${TZ_SHANGHAI}`)).json();
+    assert.deepEqual(stats.daily, [
+      {
+        ...emptyDay('2026-11-12'),
+        feedCount: 1,
+        totalMl: 10,
+        formulaCount: 1,
+        diaperCount: 1,
+        peeCount: 1,
+        bathCount: 1,
+      },
+      {
+        ...emptyDay('2026-11-13'),
+        feedCount: 1,
+        totalMl: 20,
+        formulaCount: 1,
+        diaperCount: 1,
+        poopCount: 1,
+        bathCount: 1,
+      },
+    ]);
+  });
+
+  test('省略 tzOffset：按服务器本地时区，endDate 为本地今天', async (t) => {
+    const { url } = await startApp(t);
+    const stats = await (await getJson(url, '/api/stats?days=5')).json();
+    const d = new Date(NOW);
+    const expectedDate = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(
+      d.getDate(),
+    ).padStart(2, '0')}`;
+    assert.equal(stats.endDate, expectedDate);
+    assert.equal(stats.daily.at(-1).date, expectedDate);
+    assert.equal(stats.daily.length, 5);
   });
 });
 
@@ -817,6 +1230,26 @@ describe('DELETE /api/events/:id', () => {
     assert.deepEqual(events.map((event) => event.id), [e2.id]);
   });
 
+  test('删除洗澡：204 后 state.lastBath=null、today.bathCount=0、事件列表不再包含', async (t) => {
+    const { url } = await startApp(t);
+    const bath = (await (await postBath(url, { happenedAt: NOW - HOUR, note: '洗香香' })).json()).event;
+
+    const before = await (await getJson(url, `/api/state?tzOffset=${TZ_SHANGHAI}`)).json();
+    assert.equal(before.lastBath.id, bath.id);
+    assert.equal(before.today.bathCount, 1);
+    const listed = await (await getJson(url, '/api/events')).json();
+    assert.deepEqual(listed.events, [bath]);
+
+    const del = await fetch(`${url}/api/events/${bath.id}`, { method: 'DELETE' });
+    assert.equal(del.status, 204);
+    assert.equal(await del.text(), '');
+
+    const state = await (await getJson(url, `/api/state?tzOffset=${TZ_SHANGHAI}`)).json();
+    assert.equal(state.lastBath, null);
+    assert.equal(state.today.bathCount, 0);
+    assert.deepEqual((await (await getJson(url, '/api/events')).json()).events, []);
+  });
+
   test('非法 id / 非 DELETE 方法', async (t) => {
     const { url } = await startApp(t);
     for (const pathname of ['/api/events/abc', '/api/events/0', '/api/events/-1', '/api/events/1.5', '/api/events/99999999999999999']) {
@@ -957,6 +1390,32 @@ describe('GET /api/export.csv', () => {
     assert.deepEqual([...buffer.subarray(0, 3)], [0xef, 0xbb, 0xbf]);
     const text = buffer.toString('utf8').replace(/^\uFEFF/, '');
     assert.equal(text, '时间,类别,项目,奶量(ml),备注\r\n');
+  });
+
+  test('洗澡行：类别=洗澡、项目=洗澡、奶量为空、备注转义，按时间升序', async (t) => {
+    const { url } = await startApp(t);
+    const t0 = NOW - 3 * HOUR;
+    const t1 = NOW - 2 * HOUR;
+    const t2 = NOW - HOUR;
+    await postFeeding(url, { feedTypes: ['formula'], amountMl: 60, happenedAt: t0 });
+    await postDiaper(url, { diaperKind: 'pee', happenedAt: t1 });
+    await postBath(url, { note: '洗香香, 很乖', happenedAt: t2 });
+
+    const res = await fetch(`${url}/api/export.csv`);
+    assert.equal(res.status, 200);
+    const text = Buffer.from(await res.arrayBuffer())
+      .toString('utf8')
+      .replace(/^\uFEFF/, '');
+    const rows = parseCsv(text).filter((row) => row.length > 1 || row[0] !== '');
+    assert.deepEqual(rows[0], ['时间', '类别', '项目', '奶量(ml)', '备注']);
+
+    const bathRow = rows.find((row) => row[1] === '洗澡');
+    assert.ok(bathRow, 'CSV 应包含洗澡行');
+    assert.deepEqual(bathRow.slice(1), ['洗澡', '洗澡', '', '洗香香, 很乖']);
+    // 升序：最后一行是时间最晚的洗澡（t2）
+    assert.deepEqual(rows.at(-1).slice(1), ['洗澡', '洗澡', '', '洗香香, 很乖']);
+    // 原始文本中逗号单元格应加引号
+    assert.ok(text.includes('"洗香香, 很乖"'));
   });
 });
 

@@ -1,5 +1,5 @@
 /**
- * 奶记 · 前端交互（ES Module，无第三方依赖，v2）
+ * 奶记 · 前端交互（ES Module，无第三方依赖，v3）
  *
  * 设计要点：
  * - 所有事件用 addEventListener 绑定（CSP 禁止内联脚本）。
@@ -7,9 +7,12 @@
  * - 喂奶类型为**多选标签**（至少一个，规范顺序 formula → breast_milk → breast_direct）：
  *   选中的标签持久化到 localStorage['naiji.feedTypes']；含奶粉/母乳时显示奶量面板，
  *   点一下奶量即 POST { feedTypes, amountMl } 记录一条；仅亲喂时显示「亲喂一次」按钮。
+ * - 洗澡（v3）：一键 POST /api/baths，与大小便一样进时间线/今日汇总，并重置「距上次换尿布/洗澡」。
  * - Hero「距离上次喂奶」用本地 Date.now() 与 lastFeeding.happenedAt 计算，每秒刷新。
+ * - 趋势（v3）：GET /api/stats 按天聚合，手绘内联 SVG 折线图（无第三方库 / 无 canvas），
+ *   7 天 / 30 天切换按范围缓存，指标切换不发请求；SSE 数据变更后若趋势卡可见则静默重拉。
  * - 记录成功后先用 POST 返回的 event 就地更新（Hero 立即变「刚刚」），
- *   删除后用 /api/state 校准 lastFeeding / today，避免本地推算误差。
+ *   删除后用 /api/state 校准 lastFeeding / lastDiaper / lastBath / today，避免本地推算误差。
  * - 请求进行中禁用所有记录按钮，防止连点重复记录。
  */
 
@@ -38,6 +41,20 @@ const TOAST_UNDO_MS = 5000;
 const TOAST_ERROR_MS = 4200;
 const TOAST_PLAIN_MS = 3000;
 const TOAST_SHORT_MS = 1800;
+// 趋势卡：范围、指标、SSE 变更后的静默重拉（节流 ~1s）
+const STATS_DAYS_OPTIONS = [7, 30];
+const STATS_DEFAULT_DAYS = 7;
+const STATS_REFRESH_THROTTLE_MS = 1000;
+const STATS_MIN_RELOAD_GAP_MS = 700;
+const STATS_METRICS = [
+  { key: 'totalMl', label: '奶量', unit: 'ml' },
+  { key: 'feedCount', label: '喂奶次数', unit: '次' },
+  { key: 'breastDirectCount', label: '亲喂', unit: '次' },
+  { key: 'peeCount', label: '小便', unit: '次' },
+  { key: 'poopCount', label: '大便', unit: '次' },
+  { key: 'bathCount', label: '洗澡', unit: '次' },
+];
+const STATS_METRICS_BY_KEY = Object.fromEntries(STATS_METRICS.map((metric) => [metric.key, metric]));
 // 浏览器标签标题：有上次喂奶时显示「距上次 X 小时 X 分钟 · 奶记」，方便瞥一眼
 const BASE_TITLE = '奶记 · 婴儿喂养记录';
 const TITLE_NAME = '奶记';
@@ -53,6 +70,7 @@ const state = {
   error: null,
   lastFeeding: null,
   lastDiaper: null,
+  lastBath: null,
   today: null,
   events: [], // 已加载的事件，happenedAt DESC, id DESC
   hasMore: false,
@@ -60,6 +78,23 @@ const state = {
   loadingMore: false,
   deletingIds: new Set(),
   rolloverChecking: false,
+};
+
+/** 趋势卡状态：按范围缓存 daily，指标切换只重绘不重新请求 */
+const statsState = {
+  range: STATS_DEFAULT_DAYS,
+  metric: 'totalMl',
+  cache: new Map(), // days -> daily[]
+  staleRanges: new Set(), // 数据变更后待重拉的范围
+  visible: false,
+  loading: false,
+  loadingRange: null,
+  requestSeq: 0,
+  lastFetchAt: 0,
+  lastError: null,
+  refreshTimer: null,
+  pendingRefresh: false,
+  renderedWidth: 0,
 };
 
 let writeInFlight = 0;
@@ -95,7 +130,13 @@ const els = {
   breastDirectBtn: byTestId('record-breast-direct'),
   peeBtn: byTestId('record-pee'),
   poopBtn: byTestId('record-poop'),
+  bathBtn: byTestId('record-bath'),
   todaySummary: byTestId('today-summary'),
+  statsCard: byTestId('stats-card'),
+  statsChart: byTestId('stats-chart'),
+  statsSummary: byTestId('stats-summary'),
+  statsRangeButtons: [...document.querySelectorAll('.stats-range-btn')],
+  statsMetricButtons: [...document.querySelectorAll('.stats-metric')],
   history: byTestId('history-list'),
   historyCount: document.getElementById('historyCount'),
   emptyState: byTestId('empty-state'),
@@ -169,6 +210,16 @@ function findLatestOfKind(kind) {
     if (event.kind === kind) return event;
   }
   return null;
+}
+
+/**
+ * 「距上次换尿布/洗澡」取 lastDiaper 与 lastBath 中发生时间较晚者（洗澡也视为一次清洁）。
+ * @returns {object|null}
+ */
+function latestCleaningEvent(lastDiaper, lastBath) {
+  if (!lastDiaper) return lastBath ?? null;
+  if (!lastBath) return lastDiaper;
+  return lastDiaper.happenedAt >= lastBath.happenedAt ? lastDiaper : lastBath;
 }
 
 function currentDateKey() {
@@ -272,6 +323,8 @@ function applyTodayAdd(event) {
     } else if (event.diaperKind === 'poop') {
       today.poopCount = (today.poopCount ?? 0) + 1;
     }
+  } else if (event.kind === 'bath') {
+    today.bathCount = (today.bathCount ?? 0) + 1;
   }
 }
 
@@ -301,6 +354,8 @@ function applyTodayRemove(event) {
     } else if (event.diaperKind === 'poop') {
       today.poopCount = Math.max(0, (today.poopCount ?? 0) - 1);
     }
+  } else if (event.kind === 'bath') {
+    today.bathCount = Math.max(0, (today.bathCount ?? 0) - 1);
   }
 }
 
@@ -375,13 +430,15 @@ function renderHeroClocks() {
   // 浏览器标签标题同步显示「距上次 X 小时 X 分钟」，切到别的标签时也能瞥一眼
   setDocumentTitle(documentTitleFor(state.lastFeeding, now));
 
+  // 第三行：换尿布/洗澡（洗澡也视为一次清洁，取 lastDiaper / lastBath 较晚者）
+  const lastCleaning = latestCleaningEvent(state.lastDiaper, state.lastBath);
   let diaperText;
-  if (state.lastDiaper) {
-    diaperText = `距上次换尿布 ${formatDuration(now - state.lastDiaper.happenedAt)}`;
+  if (lastCleaning) {
+    diaperText = `距上次换尿布/洗澡 ${formatDuration(now - lastCleaning.happenedAt)}`;
   } else if (state.error) {
-    diaperText = '大小便记录暂时无法加载';
+    diaperText = '换尿布/洗澡记录暂时无法加载';
   } else if (state.loaded) {
-    diaperText = '还没有大小便记录';
+    diaperText = '还没有换尿布/洗澡记录';
   } else {
     diaperText = '正在加载…';
   }
@@ -425,13 +482,14 @@ function renderSummary() {
     return;
   }
 
-  // v2 汇总：喂奶 N 次 · 奶量 M ml · 亲喂 K 次 · 小便 X · 大便 Y
+  // v3 汇总：喂奶 N 次 · 奶量 M ml · 亲喂 K 次 · 小便 X · 大便 Y · 洗澡 Z 次
   const parts = [
     ['喂奶 ', today.feedCount ?? 0, ' 次'],
     ['奶量 ', today.totalMl ?? 0, ' ml'],
     ['亲喂 ', today.breastDirectCount ?? 0, ' 次'],
     ['小便 ', today.peeCount ?? 0, ''],
     ['大便 ', today.poopCount ?? 0, ''],
+    ['洗澡 ', today.bathCount ?? 0, ' 次'],
   ];
 
   const fragment = document.createDocumentFragment();
@@ -489,7 +547,15 @@ function renderEventItem(event) {
 
   const icon = makeEl('span', 'event-icon', eventIcon(event));
   icon.dataset.tone =
-    event.kind === 'feed' ? 'feed' : event.diaperKind === 'pee' ? 'pee' : event.diaperKind === 'poop' ? 'poop' : 'mixed';
+    event.kind === 'feed'
+      ? 'feed'
+      : event.kind === 'bath'
+        ? 'bath'
+        : event.diaperKind === 'pee'
+          ? 'pee'
+          : event.diaperKind === 'poop'
+            ? 'poop'
+            : 'mixed';
   icon.setAttribute('aria-hidden', 'true');
 
   const body = makeEl('div', 'event-body');
@@ -573,6 +639,7 @@ function applyServerState(data) {
   if (!data || typeof data !== 'object') throw new ApiError('服务返回的数据格式不正确');
   state.lastFeeding = data.lastFeeding ?? null;
   state.lastDiaper = data.lastDiaper ?? null;
+  state.lastBath = data.lastBath ?? null;
   state.today = data.today ?? null;
 
   const recent = Array.isArray(data.recent) ? data.recent : [];
@@ -611,6 +678,7 @@ async function refreshStateQuietly() {
     applyServerState(data);
     state.error = null;
     state.loaded = true;
+    invalidateStats();
     return true;
   } catch (error) {
     console.warn('[奶记] 后台校准失败:', error);
@@ -650,6 +718,7 @@ function applyServerStateFresh(data) {
   if (!data || typeof data !== 'object') throw new ApiError('服务返回的数据格式不正确');
   state.lastFeeding = data.lastFeeding ?? null;
   state.lastDiaper = data.lastDiaper ?? null;
+  state.lastBath = data.lastBath ?? null;
   state.today = data.today ?? null;
   const recent = Array.isArray(data.recent) ? data.recent : [];
   state.events = recent;
@@ -669,6 +738,7 @@ async function refreshNow({ silent = false } = {}) {
   try {
     const data = await request(stateUrl());
     applyServerStateFresh(data);
+    invalidateStats();
     renderAll();
     if (!silent) showToast('已刷新最新数据', { duration: TOAST_SHORT_MS });
     return true;
@@ -827,9 +897,12 @@ function handleEventCreated(event) {
     if (!state.lastFeeding || compareEventsDesc(event, state.lastFeeding) < 0) state.lastFeeding = event;
   } else if (event.kind === 'diaper') {
     if (!state.lastDiaper || compareEventsDesc(event, state.lastDiaper) < 0) state.lastDiaper = event;
+  } else if (event.kind === 'bath') {
+    if (!state.lastBath || compareEventsDesc(event, state.lastBath) < 0) state.lastBath = event;
   }
 
   applyTodayAdd(event);
+  invalidateStats();
   newEventId = event.id;
   renderAll();
   if (!state.loaded) void loadState();
@@ -848,7 +921,9 @@ function handleEventRemoved(event) {
 
   if (state.lastFeeding && state.lastFeeding.id === event.id) state.lastFeeding = findLatestOfKind('feed');
   if (state.lastDiaper && state.lastDiaper.id === event.id) state.lastDiaper = findLatestOfKind('diaper');
+  if (state.lastBath && state.lastBath.id === event.id) state.lastBath = findLatestOfKind('bath');
 
+  invalidateStats();
   renderAll();
 }
 
@@ -915,6 +990,29 @@ async function recordDiaper(diaperKind) {
   }
 }
 
+async function recordBath() {
+  if (writeInFlight > 0 || !state.loaded) return;
+  lockWrites();
+  try {
+    // 洗澡只有可选 happenedAt / note；这里记「现在」，body 用空对象即可
+    const data = await request('/api/baths', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: '{}',
+    });
+    const event = data && data.event;
+    if (!event) throw new ApiError('记录失败，请重试');
+    handleEventCreated(event);
+    showToast(`已记录 ${eventTitle(event)}`, { undo: () => undoCreatedEvent(event) });
+  } catch (error) {
+    console.error('[奶记] 记录洗澡失败:', error);
+    showToast(error.message, { type: 'error' });
+  } finally {
+    unlockWrites();
+    syncRecordButtons();
+  }
+}
+
 async function undoCreatedEvent(event) {
   const removed = await deleteEventById(event.id);
   if (removed) showToast(`已撤销「${eventTitle(event)}」`, { duration: TOAST_SHORT_MS });
@@ -931,7 +1029,7 @@ async function deleteEventById(id) {
   try {
     await request(`/api/events/${id}`, { method: 'DELETE' });
     if (target) handleEventRemoved(target);
-    // 用服务端状态校准 lastFeeding / lastDiaper / today（删除最后一条记录时本地无法准确推算）
+    // 用服务端状态校准 lastFeeding / lastDiaper / lastBath / today（删除最后一条记录时本地无法准确推算）
     await refreshStateQuietly();
     return true;
   } catch (error) {
@@ -1007,6 +1105,412 @@ async function loadMore() {
 }
 
 /* --------------------------------------------------------------------------
+   趋势统计（v3）：GET /api/stats → 手绘内联 SVG 折线图（零依赖，无 canvas）
+   -------------------------------------------------------------------------- */
+
+const SVG_NS = 'http://www.w3.org/2000/svg';
+/** Y 轴「好看的最大值」候选系数（1/1.5/2/2.5/3/4/5/6/8/10 × 10^n） */
+const NICE_AXIS_STEPS = [1, 1.5, 2, 2.5, 3, 4, 5, 6, 8, 10];
+/** 30 天视图 X 轴每隔几天一个日期标签 */
+const STATS_X_LABEL_EVERY = 5;
+
+function statsUrl(days) {
+  return `/api/stats?days=${days}&tzOffset=${new Date().getTimezoneOffset()}`;
+}
+
+function currentStatsMetric() {
+  return STATS_METRICS_BY_KEY[statsState.metric] ?? STATS_METRICS[0];
+}
+
+function statsMetricUnit(metric) {
+  return metric.unit === 'ml' ? 'ml' : '次';
+}
+
+/** 取某指标在 daily 里的数值序列（缺字段 / 非法值补 0） */
+function statsValues(daily, metric) {
+  return daily.map((item) => {
+    const value = Number(item && item[metric.key]);
+    return Number.isFinite(value) && value > 0 ? value : 0;
+  });
+}
+
+function svgNode(tag, attrs = {}, text = null) {
+  const node = document.createElementNS(SVG_NS, tag);
+  for (const [key, value] of Object.entries(attrs)) {
+    if (value !== null && value !== undefined) node.setAttribute(key, String(value));
+  }
+  if (text !== null) node.textContent = text;
+  return node;
+}
+
+/** Y 轴最大值：全 0 时按 1（契约）；否则向上取整到较好看的刻度，保证 3 条网格线数值清爽 */
+function niceAxisMax(rawMax, unit) {
+  if (!Number.isFinite(rawMax) || rawMax <= 0) return 1;
+  const magnitude = 10 ** Math.floor(Math.log10(rawMax));
+  const fraction = rawMax / magnitude;
+  const step = NICE_AXIS_STEPS.find((candidate) => fraction <= candidate + 1e-9) ?? 10;
+  let max = step * magnitude;
+  if (unit !== 'ml') {
+    // 次数轴：中线与刻度保持整数
+    max = Math.max(2, Math.ceil(max / 2) * 2);
+  }
+  return max;
+}
+
+function formatAxisNumber(value) {
+  if (!Number.isFinite(value)) return '';
+  const rounded = Math.round(value * 10) / 10;
+  return Number.isInteger(rounded) ? String(rounded) : rounded.toFixed(1);
+}
+
+function formatAverage(value) {
+  const rounded = Math.round(value * 10) / 10;
+  return Number.isInteger(rounded) ? String(rounded) : rounded.toFixed(1);
+}
+
+/** 汇总行数据：「N 天合计 X · 日均 Y · 最高 M（MM-DD）」，单位随指标 */
+function statsSummaryData(daily, days, metric) {
+  const values = statsValues(daily, metric);
+  const unit = statsMetricUnit(metric);
+  const total = values.reduce((sum, value) => sum + value, 0);
+  const max = values.length > 0 ? Math.max(...values) : 0;
+  const maxIndex = max > 0 ? values.indexOf(max) : values.length - 1;
+  const maxDay = daily[maxIndex];
+  return {
+    unit,
+    total,
+    max,
+    average: formatAverage(days > 0 ? total / days : 0),
+    maxDate: maxDay && typeof maxDay.date === 'string' ? maxDay.date.slice(5) : '—',
+  };
+}
+
+/** 汇总行渲染成若干 nowrap 片段，窄屏换行时不会把「540 ml（11-13）」拆散 */
+function renderStatsSummary(daily, days, metric) {
+  const data = statsSummaryData(daily, days, metric);
+  const fragment = document.createDocumentFragment();
+  fragment.append(makeEl('span', 'stats-summary-group', `${days} 天合计 ${data.total} ${data.unit}`));
+  fragment.append(' · ');
+  fragment.append(makeEl('span', 'stats-summary-group', `日均 ${data.average} ${data.unit}`));
+  fragment.append(' · ');
+  fragment.append(makeEl('span', 'stats-summary-group', `最高 ${data.max} ${data.unit}`));
+  fragment.append(makeEl('span', 'stats-summary-date', `（${data.maxDate}）`));
+  els.statsSummary.replaceChildren(fragment);
+}
+
+/**
+ * 手绘折线图：折线 + 面积渐变 + 数据点；7 天标每个点的数值，30 天只标最高点；
+ * X 轴 MM-DD（7 天全显示，30 天每 5 天一个）；Y 轴 3 条网格线 + 数值。
+ */
+function buildStatsChartSvg(daily, days, metric) {
+  const containerWidth = Math.round(els.statsChart.clientWidth) || 280;
+  const width = Math.max(236, containerWidth);
+  const height = width <= 300 ? 146 : 164;
+  const values = statsValues(daily, metric);
+  const rawMax = values.length > 0 ? Math.max(...values) : 0;
+  const yMax = niceAxisMax(rawMax, metric.unit);
+  const margin = { top: 20, right: 12, bottom: 22, left: 34 };
+  const plotWidth = Math.max(1, width - margin.left - margin.right);
+  const plotHeight = Math.max(1, height - margin.top - margin.bottom);
+  const baseY = margin.top + plotHeight;
+  const pointCount = values.length;
+  const xFor = (index) =>
+    margin.left + (pointCount <= 1 ? plotWidth / 2 : (plotWidth * index) / (pointCount - 1));
+  const yFor = (value) => margin.top + plotHeight * (1 - value / yMax);
+  const xText = (value) => value.toFixed(2);
+  const yText = (value) => value.toFixed(2);
+
+  const svg = svgNode('svg', {
+    viewBox: `0 0 ${width} ${height}`,
+    width,
+    height,
+    class: 'stats-svg',
+    'aria-hidden': 'true',
+    focusable: 'false',
+  });
+
+  // 面积渐变（颜色走 CSS 变量，自动适配深色模式）
+  const defs = svgNode('defs');
+  const gradient = svgNode('linearGradient', { id: 'statsAreaGradient', x1: '0', y1: '0', x2: '0', y2: '1' });
+  gradient.append(svgNode('stop', { offset: '0%', class: 'stats-area-stop-start' }));
+  gradient.append(svgNode('stop', { offset: '100%', class: 'stats-area-stop-end' }));
+  defs.append(gradient);
+  svg.append(defs);
+
+  // 3 条网格线 + Y 轴数值
+  for (const value of [yMax, yMax / 2, 0]) {
+    const y = yFor(value);
+    svg.append(
+      svgNode('line', {
+        x1: margin.left,
+        y1: yText(y),
+        x2: width - margin.right,
+        y2: yText(y),
+        class: value === 0 ? 'stats-grid-line stats-grid-line--base' : 'stats-grid-line',
+      }),
+    );
+    svg.append(
+      svgNode(
+        'text',
+        { x: margin.left - 7, y: yText(y + 3.2), 'text-anchor': 'end', class: 'stats-axis-label' },
+        formatAxisNumber(value),
+      ),
+    );
+  }
+
+  if (pointCount > 0) {
+    const lineSegments = values.map(
+      (value, index) => `${index === 0 ? 'M' : 'L'} ${xText(xFor(index))} ${yText(yFor(value))}`,
+    );
+    const linePath = lineSegments.join(' ');
+    const areaPath =
+      `M ${xText(xFor(0))} ${yText(baseY)} ` +
+      values.map((value, index) => `L ${xText(xFor(index))} ${yText(yFor(value))}`).join(' ') +
+      ` L ${xText(xFor(pointCount - 1))} ${yText(baseY)} Z`;
+
+    svg.append(svgNode('path', { d: areaPath, class: 'stats-area' }));
+    svg.append(
+      svgNode('path', { d: linePath, class: 'stats-line stats-line--draw', pathLength: '1', fill: 'none' }),
+    );
+
+    const maxIndex = rawMax > 0 ? values.indexOf(rawMax) : -1;
+    const dotRadius = days > 7 ? 2.6 : 3.2;
+    values.forEach((value, index) => {
+      const x = xFor(index);
+      const y = yFor(value);
+      const isMax = index === maxIndex;
+      svg.append(
+        svgNode('circle', {
+          cx: xText(x),
+          cy: yText(y),
+          r: isMax ? 4.2 : dotRadius,
+          class: isMax ? 'stats-point stats-point--max' : 'stats-point',
+        }),
+      );
+      // 7 天视图每个点标数值；30 天视图只标最高点
+      if (days > 7 && !isMax) return;
+      const anchor = index === 0 ? 'start' : index === pointCount - 1 ? 'end' : 'middle';
+      svg.append(
+        svgNode(
+          'text',
+          {
+            x: xText(x),
+            y: yText(y - 8),
+            'text-anchor': anchor,
+            class: isMax ? 'stats-value-label stats-value-label--max' : 'stats-value-label',
+          },
+          String(value),
+        ),
+      );
+    });
+
+    // X 轴日期标签：7 天全显示；30 天从今天往回每 5 天一个（保证今天有标签）
+    daily.forEach((day, index) => {
+      if (days > 7 && (pointCount - 1 - index) % STATS_X_LABEL_EVERY !== 0) return;
+      svg.append(
+        svgNode(
+          'text',
+          {
+            x: xText(xFor(index)),
+            y: height - 6,
+            'text-anchor': 'middle',
+            class: 'stats-axis-label stats-x-label',
+          },
+          typeof day.date === 'string' ? day.date.slice(5) : '',
+        ),
+      );
+    });
+
+    if (rawMax <= 0) {
+      svg.append(
+        svgNode(
+          'text',
+          {
+            x: xText(margin.left + plotWidth / 2),
+            y: yText(margin.top + plotHeight / 2 + 4),
+            'text-anchor': 'middle',
+            class: 'stats-empty-text',
+          },
+          `最近 ${days} 天还没有数据`,
+        ),
+      );
+    }
+  }
+
+  return svg;
+}
+
+/** 占位：趋势还没有数据 / 正在加载 */
+function renderStatsPlaceholder() {
+  els.statsChart.replaceChildren(makeEl('p', 'stats-chart-note', '正在加载趋势…'));
+  els.statsSummary.className = 'stats-summary stats-summary--muted';
+  els.statsSummary.textContent = '正在加载趋势…';
+}
+
+function renderStatsControls() {
+  for (const button of els.statsRangeButtons) {
+    button.setAttribute('aria-pressed', String(Number(button.dataset.range) === statsState.range));
+  }
+  for (const button of els.statsMetricButtons) {
+    button.setAttribute('aria-pressed', String(button.dataset.metric === statsState.metric));
+  }
+}
+
+function renderStats() {
+  renderStatsControls();
+  const days = statsState.range;
+  const metric = currentStatsMetric();
+  els.statsChart.setAttribute('aria-label', `最近 ${days} 天${metric.label}趋势`);
+
+  const daily = statsState.cache.get(days);
+  if (!daily) {
+    if (statsState.lastError) {
+      const box = makeEl('div', 'stats-chart-empty');
+      box.append(makeEl('p', 'stats-chart-note', '趋势数据暂时无法加载'));
+      const retry = makeEl('button', 'stats-retry', '重新加载');
+      retry.type = 'button';
+      retry.addEventListener('click', () => {
+        statsState.lastError = null;
+        renderStats();
+        void fetchStats(statsState.range);
+      });
+      box.append(retry);
+      els.statsChart.replaceChildren(box);
+      els.statsSummary.className = 'stats-summary stats-summary--muted';
+      els.statsSummary.textContent = '趋势数据暂时无法加载';
+    } else {
+      renderStatsPlaceholder();
+    }
+    return;
+  }
+
+  els.statsChart.replaceChildren(buildStatsChartSvg(daily, days, metric));
+  statsState.renderedWidth = Math.round(els.statsChart.clientWidth);
+  els.statsSummary.className = 'stats-summary';
+  renderStatsSummary(daily, days, metric);
+}
+
+/** 拉取某个范围的按天聚合；切换指标不会触发请求，切换范围命中缓存也不会 */
+async function fetchStats(days) {
+  const seq = ++statsState.requestSeq;
+  statsState.loading = true;
+  statsState.loadingRange = days;
+  if (!statsState.cache.has(days)) renderStats();
+  try {
+    const data = await request(statsUrl(days));
+    if (seq !== statsState.requestSeq) return;
+    const daily = data && Array.isArray(data.daily) ? data.daily : [];
+    if (daily.length !== days) throw new ApiError('趋势数据格式不正确');
+    statsState.cache.set(days, daily);
+    statsState.staleRanges.delete(days);
+    statsState.lastFetchAt = Date.now();
+    statsState.lastError = null;
+  } catch (error) {
+    if (seq !== statsState.requestSeq) return;
+    console.warn('[奶记] 趋势数据加载失败:', error);
+    if (!statsState.cache.has(days)) statsState.lastError = error.message;
+  } finally {
+    if (seq === statsState.requestSeq) {
+      statsState.loading = false;
+      statsState.loadingRange = null;
+      renderStats();
+      if (statsState.pendingRefresh) {
+        statsState.pendingRefresh = false;
+        scheduleStatsRefresh();
+      }
+    }
+  }
+}
+
+/** 数据变更后标记趋势数据过期；趋势卡在视口内才静默重拉（节流 ~1s） */
+function invalidateStats() {
+  for (const days of STATS_DAYS_OPTIONS) statsState.staleRanges.add(days);
+  if (!statsState.visible) return;
+  scheduleStatsRefresh();
+}
+
+function scheduleStatsRefresh() {
+  if (statsState.refreshTimer) return;
+  statsState.refreshTimer = window.setTimeout(() => {
+    statsState.refreshTimer = null;
+    if (!statsState.visible) return;
+    const days = statsState.range;
+    if (statsState.loading) {
+      statsState.pendingRefresh = true;
+      return;
+    }
+    if (!statsState.staleRanges.has(days) && statsState.cache.has(days)) return;
+    // 刚拉取过就再等一拍，避免和首屏 / 上一次请求贴太近
+    if (Date.now() - statsState.lastFetchAt < STATS_MIN_RELOAD_GAP_MS) {
+      scheduleStatsRefresh();
+      return;
+    }
+    void fetchStats(days);
+  }, STATS_REFRESH_THROTTLE_MS);
+}
+
+/** 缓存缺失或已过期时才请求，避免重复拉取 */
+function ensureStats(days) {
+  if (statsState.cache.has(days) && !statsState.staleRanges.has(days)) return;
+  if (statsState.loading && statsState.loadingRange === days) return;
+  void fetchStats(days);
+}
+
+function selectStatsRange(days) {
+  if (!STATS_DAYS_OPTIONS.includes(days) || days === statsState.range) return;
+  statsState.range = days;
+  statsState.lastError = null;
+  renderStatsControls();
+  const cached = statsState.cache.get(days);
+  if (cached) renderStats();
+  ensureStats(days);
+}
+
+function selectStatsMetric(key) {
+  if (!STATS_METRICS_BY_KEY[key] || key === statsState.metric) return;
+  statsState.metric = key;
+  renderStatsControls();
+  renderStats();
+}
+
+/** 趋势卡是否在视口内：决定 SSE 变更后是否静默重拉；首次可见时懒加载 */
+function observeStatsVisibility() {
+  if (!els.statsCard || typeof IntersectionObserver !== 'function') {
+    statsState.visible = true;
+    ensureStats(statsState.range);
+    return;
+  }
+  const observer = new IntersectionObserver(
+    (entries) => {
+      for (const entry of entries) {
+        statsState.visible = entry.isIntersecting;
+        if (!entry.isIntersecting) continue;
+        ensureStats(statsState.range);
+      }
+    },
+    { rootMargin: '180px 0px' },
+  );
+  observer.observe(els.statsCard);
+}
+
+/** 容器宽度变化（旋转屏幕 / 桌面拉伸）时按新宽度重绘 SVG，保证文字不糊 */
+function observeStatsChartSize() {
+  if (!els.statsChart) return;
+  const rerender = () => {
+    const width = Math.round(els.statsChart.clientWidth);
+    if (width === statsState.renderedWidth) return;
+    if (!statsState.cache.has(statsState.range)) return;
+    renderStats();
+  };
+  if (typeof ResizeObserver !== 'function') {
+    window.addEventListener('resize', rerender);
+    return;
+  }
+  const observer = new ResizeObserver(rerender);
+  observer.observe(els.statsChart);
+}
+
+/* --------------------------------------------------------------------------
    初始化
    -------------------------------------------------------------------------- */
 
@@ -1027,6 +1531,13 @@ function bindEvents() {
   els.breastDirectBtn.addEventListener('click', () => void recordFeeding());
   els.peeBtn.addEventListener('click', () => void recordDiaper('pee'));
   els.poopBtn.addEventListener('click', () => void recordDiaper('poop'));
+  els.bathBtn.addEventListener('click', () => void recordBath());
+  for (const button of els.statsRangeButtons) {
+    button.addEventListener('click', () => selectStatsRange(Number(button.dataset.range)));
+  }
+  for (const button of els.statsMetricButtons) {
+    button.addEventListener('click', () => selectStatsMetric(button.dataset.metric));
+  }
   els.loadMore.addEventListener('click', () => void loadMore());
   els.refreshBtn.addEventListener('click', () => void refreshNow());
   els.retryBtn.addEventListener('click', () => {
@@ -1049,7 +1560,12 @@ function init() {
   if (els.exportLink) els.exportLink.href = apiUrl('/api/export.csv');
 
   renderFeedTypes();
+  renderStatsControls();
+  renderStats();
   bindEvents();
+  observeStatsVisibility();
+  observeStatsChartSize();
+  ensureStats(statsState.range);
   syncRefreshButton();
   syncRecordButtons();
   renderAll();

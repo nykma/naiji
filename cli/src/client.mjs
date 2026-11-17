@@ -140,6 +140,15 @@ export class NaijiClient {
     return payload.event;
   }
 
+  /** POST /api/baths → 返回创建的 event（kind: "bath"） */
+  async createBath(body) {
+    const payload = await this.request('POST', '/api/baths', { body });
+    if (!payload?.event) {
+      throw new ApiError('服务器响应缺少 event 字段', { code: 'invalid_response' });
+    }
+    return payload.event;
+  }
+
   /** DELETE /api/events/:id */
   async deleteEvent(id) {
     return this.request('DELETE', `/api/events/${id}`);

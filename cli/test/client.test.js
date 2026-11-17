@@ -76,6 +76,51 @@ test('createDiaper：POST /api/diapers', async (t) => {
   assert.deepEqual(stub.requests[0].body, { diaperKind: 'mixed', note: '有点多' });
 });
 
+test('createBath：POST /api/baths，method/路径/JSON body 正确', async (t) => {
+  const stub = await startStubServer((record, res) => {
+    replyJson(res, 201, {
+      event: {
+        id: 9,
+        kind: 'bath',
+        feedTypes: null,
+        amountMl: null,
+        diaperKind: null,
+        note: record.body.note ?? null,
+        happenedAt: record.body.happenedAt ?? 1763000000000,
+        createdAt: 1763000000000,
+      },
+    });
+  });
+  t.after(() => stub.close());
+
+  const client = new NaijiClient({ server: stub.baseUrl });
+  const event = await client.createBath({ happenedAt: 1763000000000, note: '洗香香' });
+
+  assert.equal(event.id, 9);
+  assert.equal(event.kind, 'bath');
+  assert.equal(stub.requests.length, 1);
+  const [request] = stub.requests;
+  assert.equal(request.method, 'POST');
+  assert.equal(request.pathname, '/api/baths');
+  assert.match(String(request.headers['content-type']), /application\/json/);
+  assert.deepEqual(request.body, { happenedAt: 1763000000000, note: '洗香香' });
+
+  // 不传任何字段时 body 为 {}（服务端用 now、无备注）
+  await client.createBath({});
+  assert.deepEqual(stub.requests[1].body, {});
+});
+
+test('createBath：响应缺少 event 字段时抛 ApiError', async (t) => {
+  const stub = await startStubServer((record, res) => replyJson(res, 201, {}));
+  t.after(() => stub.close());
+
+  const client = new NaijiClient({ server: stub.baseUrl });
+  await assert.rejects(
+    () => client.createBath({}),
+    (error) => error instanceof ApiError && error.code === 'invalid_response',
+  );
+});
+
 test('getState：GET /api/state 且带 tzOffset', async (t) => {
   const state = {
     now: 1763000000000,

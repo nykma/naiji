@@ -5,6 +5,7 @@ import test from 'node:test';
 
 import { formatDayKey } from '../src/format.mjs';
 import {
+  bathEvent,
   diaperEvent,
   emptyToday,
   feedEvent,
@@ -30,7 +31,9 @@ const FEED_STATE = makeState({
   now: NOW,
   lastFeeding: feedEvent({ id: 3, feedTypes: ['formula', 'breast_direct'], amountMl: 60, happenedAt: NOW - 30 * 60_000 }),
   lastDiaper: diaperEvent({ id: 2, diaperKind: 'poop', happenedAt: NOW - 65 * 60_000 }),
-  today: emptyToday({ date: TODAY, feedCount: 4, totalMl: 360, breastDirectCount: 1, peeCount: 2, poopCount: 1 }),
+  // 洗澡早于换尿布：「距上次换尿布/洗澡」应取换尿布
+  lastBath: bathEvent({ id: 1, happenedAt: NOW - 3 * 60 * 60_000 }),
+  today: emptyToday({ date: TODAY, feedCount: 4, totalMl: 360, breastDirectCount: 1, peeCount: 2, poopCount: 1, bathCount: 1 }),
   recent: [],
 });
 
@@ -54,9 +57,44 @@ test('status 人类可读输出', async (t) => {
   assert.equal(result.code, 0);
   assert.match(result.stdout, /🍼 距离上次喂奶  30 分钟/);
   assert.match(result.stdout, /上次 21:30 · 奶粉 \+ 亲喂 60 ml/);
-  assert.match(result.stdout, /💧 距上次换尿布  1 小时 5 分钟/);
-  assert.match(result.stdout, /今日 喂奶 4 次 · 奶量 360 ml · 亲喂 1 次 · 小便 2 · 大便 1/);
+  assert.match(result.stdout, /💧 距上次换尿布\/洗澡  1 小时 5 分钟/);
+  assert.match(result.stdout, /上次 20:55 · 大便/);
+  assert.match(
+    result.stdout,
+    /今日 喂奶 4 次 · 奶量 360 ml · 亲喂 1 次 · 小便 2 · 大便 1 · 洗澡 1 次/,
+  );
   assert.equal(result.stderr, '');
+});
+
+test('status：洗澡晚于换尿布时，「距上次换尿布/洗澡」重置为洗澡', async (t) => {
+  const bathLaterState = makeState({
+    now: NOW,
+    lastFeeding: null,
+    lastDiaper: diaperEvent({ id: 2, diaperKind: 'pee', happenedAt: NOW - 3 * 60 * 60_000 }),
+    lastBath: bathEvent({ id: 3, happenedAt: NOW - 10 * 60_000 }),
+    today: emptyToday({ date: TODAY, peeCount: 1, bathCount: 1 }),
+  });
+  const stub = await startStubServer((record, res) => {
+    if (record.pathname === '/api/state') return replyJson(res, 200, bathLaterState);
+    replyJson(res, 404, { error: 'not_found', message: '接口不存在' });
+  });
+  t.after(() => stub.close());
+
+  const result = await runMain(['s', '--server', stub.baseUrl], { now });
+  assert.equal(result.code, 0);
+  assert.match(result.stdout, /💧 距上次换尿布\/洗澡  10 分钟/);
+  assert.match(result.stdout, /上次 21:50 · 洗澡/);
+  assert.match(result.stdout, /洗澡 1 次/);
+});
+
+test('status：完全没有换尿布/洗澡记录时的提示', async (t) => {
+  const emptyState = makeState({ now: NOW, today: emptyToday({ date: TODAY }) });
+  const stub = await startStubServer((record, res) => replyJson(res, 200, emptyState));
+  t.after(() => stub.close());
+
+  const result = await runMain(['status', '--server', stub.baseUrl], { now });
+  assert.equal(result.code, 0);
+  assert.match(result.stdout, /还没有换尿布\/洗澡记录/);
 });
 
 test('status --json 输出原始 state', async (t) => {
@@ -169,6 +207,102 @@ test('feed --json：输出 { event }', async (t) => {
 });
 
 // ---------------------------------------------------------------------------
+// bath
+// ---------------------------------------------------------------------------
+
+function bathStub(t) {
+  return startStubServer((record, res) => {
+    if (record.pathname !== '/api/baths' || record.method !== 'POST') {
+      return replyJson(res, 404, { error: 'not_found', message: '接口不存在' });
+    }
+    replyJson(res, 201, {
+      event: bathEvent({
+        id: 41,
+        note: record.body.note ?? null,
+        happenedAt: record.body.happenedAt ?? NOW,
+      }),
+    });
+  }).then((stub) => {
+    t.after(() => stub.close());
+    return stub;
+  });
+}
+
+test('bath：POST /api/baths（无字段），输出「✅ 已记录 洗澡 · HH:MM」', async (t) => {
+  const stub = await bathStub(t);
+  const result = await runMain(['bath', '--server', stub.baseUrl], { now });
+  assert.equal(result.code, 0);
+  assert.equal(stub.requests.length, 1);
+  assert.equal(stub.requests[0].method, 'POST');
+  assert.equal(stub.requests[0].pathname, '/api/baths');
+  assert.match(String(stub.requests[0].headers['content-type']), /application\/json/);
+  assert.deepEqual(stub.requests[0].body, {});
+  assert.equal(stripAnsi(result.stdout).trim(), '✅ 已记录 洗澡 · 22:00');
+  assert.equal(result.stderr, '');
+});
+
+test('bath 别名 b：--note + --ago 写入请求体并回显', async (t) => {
+  const stub = await bathStub(t);
+  const result = await runMain(
+    ['b', '--note', '洗香香', '--ago', '30', '--server', stub.baseUrl],
+    { now },
+  );
+  assert.equal(result.code, 0);
+  assert.deepEqual(stub.requests[0].body, {
+    note: '洗香香',
+    happenedAt: NOW - 30 * 60_000,
+  });
+  assert.equal(stripAnsi(result.stdout).trim(), '✅ 已记录 洗澡 · 21:30 · 洗香香');
+});
+
+test('bath --at：绝对时间写入 happenedAt', async (t) => {
+  const stub = await bathStub(t);
+  const result = await runMain(
+    ['bath', '--at', '2026-11-13 08:30', '--server', stub.baseUrl],
+    { now },
+  );
+  assert.equal(result.code, 0);
+  assert.equal(stub.requests[0].body.happenedAt, new Date(2026, 10, 13, 8, 30).getTime());
+  assert.match(stripAnsi(result.stdout), /✅ 已记录 洗澡 · 08:30/);
+});
+
+test('bath --json：输出服务端返回的 { event }', async (t) => {
+  const stub = await bathStub(t);
+  const result = await runMain(['bath', '--json', '--server', stub.baseUrl], { now });
+  assert.equal(result.code, 0);
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.event.id, 41);
+  assert.equal(payload.event.kind, 'bath');
+  assert.equal(payload.event.diaperKind, null);
+  assert.equal(payload.event.feedTypes, null);
+});
+
+test('bath：非法 --at 为用法错误（不请求服务端）', async (t) => {
+  const stub = await bathStub(t);
+  const result = await runMain(['bath', '--at', '25:00', '--server', stub.baseUrl], { now });
+  assert.equal(result.code, 2);
+  assert.match(result.stderr, /--at/);
+  assert.equal(stub.requests.length, 0);
+});
+
+test('bath：多余位置参数为用法错误', async () => {
+  const result = await runMain(['bath', 'extra', '--server', 'http://127.0.0.1:1'], { now });
+  assert.equal(result.code, 2);
+  assert.match(result.stderr, /不接受参数/);
+});
+
+test('bath：后端错误时退出码 1 并显示中文 message', async (t) => {
+  const stub = await startStubServer((record, res) => {
+    replyJson(res, 400, { error: 'invalid_note', message: '备注不能超过 200 个字符' });
+  });
+  t.after(() => stub.close());
+
+  const result = await runMain(['bath', '--server', stub.baseUrl], { now });
+  assert.equal(result.code, 1);
+  assert.match(result.stderr, /备注不能超过 200 个字符/);
+});
+
+// ---------------------------------------------------------------------------
 // log / today
 // ---------------------------------------------------------------------------
 
@@ -244,6 +378,38 @@ test('today：只列今天记录 + 今日汇总；--json 结构', async (t) => {
   assert.equal(payload.date, TODAY);
   assert.equal(payload.summary.feedCount, 2);
   assert.equal(payload.events.length, 2); // 只有今天的两条（昨日那条被过滤）
+});
+
+test('log：洗澡记录渲染为「🛁 洗澡」', async (t) => {
+  const bath = bathEvent({ id: 42, note: '洗香香', happenedAt: NOW - 5 * 60_000 });
+  const feed = feedEvent({ id: 41, happenedAt: NOW - 10 * 60_000 });
+  const stub = await eventsStub(t, [bath, feed]);
+
+  const result = await runMain(['log', '--server', stub.baseUrl], { now });
+  assert.equal(result.code, 0);
+  assert.match(result.stdout, /🛁 洗澡/);
+  assert.match(result.stdout, /#42/);
+  assert.match(result.stdout, /· 洗香香/);
+});
+
+test('today：洗澡记录出现在时间线并计入今日汇总', async (t) => {
+  const bath = bathEvent({ id: 43, happenedAt: NOW - 5 * 60_000 });
+  const feed = feedEvent({ id: 44, happenedAt: NOW - 10 * 60_000 });
+  const state = makeState({
+    now: NOW,
+    today: emptyToday({ date: TODAY, feedCount: 1, totalMl: 120, bathCount: 1 }),
+  });
+  const stub = await startStubServer((record, res) => {
+    if (record.pathname === '/api/state') return replyJson(res, 200, state);
+    if (record.pathname === '/api/events') return replyJson(res, 200, { events: [bath, feed] });
+    replyJson(res, 404, { error: 'not_found', message: '接口不存在' });
+  });
+  t.after(() => stub.close());
+
+  const result = await runMain(['today', '--server', stub.baseUrl], { now });
+  assert.equal(result.code, 0);
+  assert.match(result.stdout, /🛁 洗澡/);
+  assert.match(result.stdout, /今日 喂奶 1 次 · 奶量 120 ml · 亲喂 0 次 · 小便 0 · 大便 0 · 洗澡 1 次/);
 });
 
 // ---------------------------------------------------------------------------
@@ -536,12 +702,23 @@ test('--help / help <command> / <command> --help', async () => {
   assert.equal(global.code, 0);
   assert.match(global.stdout, /用法:/);
   assert.match(global.stdout, /feed, f <ml>/);
+  assert.match(global.stdout, /bath, b/);
   assert.match(global.stdout, /服务器地址优先级/);
 
   const feed = await runMain(['help', 'feed']);
   assert.equal(feed.code, 0);
   assert.match(feed.stdout, /naiji feed/);
   assert.match(feed.stdout, /--direct/);
+
+  const bath = await runMain(['help', 'bath']);
+  assert.equal(bath.code, 0);
+  assert.match(bath.stdout, /naiji bath/);
+  assert.match(bath.stdout, /--ago/);
+  assert.match(bath.stdout, /naiji b/);
+
+  const bathFlag = await runMain(['bath', '--help']);
+  assert.equal(bathFlag.code, 0);
+  assert.match(bathFlag.stdout, /naiji bath/);
 
   const feedFlag = await runMain(['feed', '--help']);
   assert.equal(feedFlag.code, 0);

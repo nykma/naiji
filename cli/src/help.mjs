@@ -12,6 +12,7 @@ const COMMAND_SUMMARIES = [
   ['pee, p', '记录小便'],
   ['poop, o', '记录大便'],
   ['diaper, d <kind>', '记录大小便（pee | poop | mixed）'],
+  ['bath, b', '记录洗澡（可加备注）'],
   ['log, l [-n 10]', '最近记录（按天分组）'],
   ['today', '今天的时间线 + 今日汇总'],
   ['undo, u', '撤销最近一条记录'],
@@ -50,6 +51,8 @@ const EXAMPLES = [
   ['naiji f 120 --at "20:30"', '补记今天 20:30'],
   ['naiji p --note 换得挺多', '记录小便 + 备注'],
   ['naiji d poop', '记录大便'],
+  ['naiji bath', '记录洗澡'],
+  ['naiji b --ago 30 --note 洗香香', '补记 30 分钟前的洗澡'],
   ['naiji log -n 20', '最近 20 条'],
   ['naiji undo --yes', '撤销最近一条（不确认）'],
   ['naiji export --out milk.csv', '导出 CSV 到文件'],
@@ -61,7 +64,8 @@ const COMMAND_HELP = {
   status: {
     usage: 'naiji status',
     lines: [
-      '查看状态卡：距离上次喂奶、上次详情、距上次换尿布、今日汇总。',
+      '查看状态卡：距离上次喂奶、上次详情、距上次换尿布/洗澡、今日汇总。',
+      '「距上次换尿布/洗澡」取 lastDiaper 与 lastBath 中较晚者（洗澡同样重置计时）。',
       '不带任何参数运行 `naiji` 等价于 `naiji status`。',
     ],
     examples: [
@@ -112,6 +116,20 @@ const COMMAND_HELP = {
       ['naiji d 大便', '中文别名同样可用'],
     ],
   },
+  bath: {
+    usage: 'naiji bath [--note <text>] [--ago <分钟> | --at <时间>]',
+    lines: [
+      '记录一次洗澡；--note / --ago / --at / --json 与其它记录命令一致。',
+      '洗澡也会重置「距上次换尿布/洗澡」计时，并计入今日汇总。',
+      '别名：naiji b',
+    ],
+    examples: [
+      ['naiji bath', '记录现在洗澡'],
+      ['naiji b --note 洗香香', '记录洗澡 + 备注'],
+      ['naiji b --ago 30', '补记 30 分钟前'],
+      ['naiji bath --json', '输出服务端返回的 event JSON'],
+    ],
+  },
   log: {
     usage: 'naiji log [-n <条数>]',
     lines: [
@@ -131,7 +149,7 @@ const COMMAND_HELP = {
   undo: {
     usage: 'naiji undo [--yes]',
     lines: [
-      '删除最近一条记录（喂奶或大小便均可）并打印被删内容。',
+      '删除最近一条记录（喂奶 / 大小便 / 洗澡均可）并打印被删内容。',
       'TTY 下会询问 y/N 确认；--yes 跳过；非 TTY（脚本调用）自动执行。',
       '别名：naiji u',
     ],

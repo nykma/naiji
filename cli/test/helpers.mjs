@@ -182,6 +182,23 @@ export function diaperEvent({
   };
 }
 
+export function bathEvent({
+  id = 3,
+  note = null,
+  happenedAt = Date.now(),
+} = {}) {
+  return {
+    id,
+    kind: 'bath',
+    feedTypes: null,
+    amountMl: null,
+    diaperKind: null,
+    note,
+    happenedAt,
+    createdAt: happenedAt,
+  };
+}
+
 export function emptyToday(overrides = {}) {
   return {
     date: '2026-01-15',
@@ -195,6 +212,7 @@ export function emptyToday(overrides = {}) {
     peeCount: 0,
     poopCount: 0,
     mixedCount: 0,
+    bathCount: 0,
     ...overrides,
   };
 }
@@ -203,8 +221,9 @@ export function makeState({
   now = Date.now(),
   lastFeeding = null,
   lastDiaper = null,
+  lastBath = null,
   today = emptyToday(),
   recent = [],
 } = {}) {
-  return { now, lastFeeding, lastDiaper, today, recent };
+  return { now, lastFeeding, lastDiaper, lastBath, today, recent };
 }

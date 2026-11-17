@@ -19,6 +19,8 @@ export const COMMAND_ALIASES = {
   o: 'poop',
   diaper: 'diaper',
   d: 'diaper',
+  bath: 'bath',
+  b: 'bath',
   log: 'log',
   l: 'log',
   today: 'today',
@@ -101,6 +103,7 @@ const COMMAND_OPTION_KEYS = {
   pee: ['note', 'ago', 'at'],
   poop: ['note', 'ago', 'at'],
   diaper: ['note', 'ago', 'at'],
+  bath: ['note', 'ago', 'at'],
   log: ['limit'],
   today: [],
   undo: ['yes'],
@@ -335,7 +338,10 @@ export function parseTimeOptions(options = {}, now = Date.now()) {
   if (ago !== undefined) {
     const text = String(ago).trim();
     if (!/^\d+$/.test(text)) {
-      throw new UsageError(`--ago 必须是分钟数（非负整数），收到：${ago}`, '例如：naiji feed 120 --ago 30');
+      throw new UsageError(
+        `--ago 必须是分钟数（非负整数），收到：${ago}`,
+        '例如：naiji feed 120 --ago 30 / naiji bath --ago 30',
+      );
     }
     happenedAt = now - Number(text) * MINUTE_MS;
   } else if (at !== undefined) {
@@ -447,6 +453,22 @@ export function buildDiaperRequest(parsed, now = Date.now()) {
   const happenedAt = parseTimeOptions(options, now);
   const note = normalizeNote(options.note);
   const body = { diaperKind };
+  if (note !== undefined) body.note = note;
+  if (happenedAt !== undefined) body.happenedAt = happenedAt;
+  return body;
+}
+
+/**
+ * bath / b 命令 → POST /api/baths 请求体。
+ * 洗澡只有 happenedAt 与 note，两者都可省略（省略 happenedAt 时由服务端取 now）。
+ * @param {ReturnType<typeof parseArgs>} parsed
+ * @param {number} [now]
+ */
+export function buildBathRequest(parsed, now = Date.now()) {
+  ensureNoPositionals('bath', parsed.positionals);
+  const happenedAt = parseTimeOptions(parsed.options, now);
+  const note = normalizeNote(parsed.options.note);
+  const body = {};
   if (note !== undefined) body.note = note;
   if (happenedAt !== undefined) body.happenedAt = happenedAt;
   return body;

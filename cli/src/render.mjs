@@ -6,7 +6,6 @@
  */
 
 import {
-  diaperKindLabel,
   eventIcon,
   eventTitle,
   formatClock,
@@ -75,9 +74,11 @@ export function renderDayGroups(events, { now = Date.now(), styler = createStyle
  *
  * 🍼 距离上次喂奶  3 小时 25 分钟
  *    上次 09:35 · 母乳（瓶喂） 90 ml
- * 💧 距上次换尿布  1 小时 5 分钟
- *    上次 12:20 · 大便
- * 今日 喂奶 4 次 · 奶量 360 ml · 亲喂 1 次 · 小便 2 · 大便 1
+ * 💧 距上次换尿布/洗澡  1 小时 5 分钟
+ *    上次 12:20 · 洗澡
+ * 今日 喂奶 4 次 · 奶量 360 ml · 亲喂 1 次 · 小便 2 · 大便 1 · 洗澡 1 次
+ *
+ * 「距上次换尿布/洗澡」取 lastDiaper / lastBath 中 happenedAt 较晚者（洗澡同样重置计时）。
  */
 export function renderStatus(state = {}, { now = Date.now(), styler = createStyler() } = {}) {
   const lines = [];
@@ -95,30 +96,38 @@ export function renderStatus(state = {}, { now = Date.now(), styler = createStyl
     lines.push(styler.dim('   记录一次：naiji feed 120'));
   }
 
-  const lastDiaper = state.lastDiaper ?? null;
-  if (lastDiaper) {
+  const lastClean = pickLater(state.lastDiaper ?? null, state.lastBath ?? null);
+  if (lastClean) {
     lines.push(
-      `💧 ${styler.bold('距上次换尿布')}  ${styler.cyan(formatDuration(now - lastDiaper.happenedAt))}`,
+      `💧 ${styler.bold('距上次换尿布/洗澡')}  ${styler.cyan(formatDuration(now - lastClean.happenedAt))}`,
     );
     lines.push(
-      styler.dim(`   上次 ${formatTimeShort(lastDiaper.happenedAt, now)} · ${diaperKindLabel(lastDiaper.diaperKind)}`),
+      styler.dim(`   上次 ${formatTimeShort(lastClean.happenedAt, now)} · ${eventTitle(lastClean)}`),
     );
   } else {
-    lines.push(`💧 ${styler.dim('还没有换尿布记录')}`);
+    lines.push(`💧 ${styler.dim('还没有换尿布/洗澡记录')}`);
   }
 
   lines.push(formatTodaySummary(state.today ?? {}));
   return lines.join('\n');
 }
 
-/** 记录成功 / 撤销 / 删除后的一行反馈 */
+/** 两个事件中取 happenedAt 较晚者；同时刻时 b（洗澡）优先，因为洗澡也会重置计时 */
+function pickLater(a, b) {
+  if (!a) return b;
+  if (!b) return a;
+  return b.happenedAt >= a.happenedAt ? b : a;
+}
+
+/** 记录成功 / 撤销 / 删除后的一行反馈（showId=false 时不显示 #id） */
 export function renderRecordResult(
   event,
-  { now = Date.now(), styler = createStyler(), verb = '已记录', icon = '✅' } = {},
+  { now = Date.now(), styler = createStyler(), verb = '已记录', icon = '✅', showId = true } = {},
 ) {
   const meta = [formatTimeShort(event.happenedAt, now)];
   if (event.note) meta.push(event.note);
-  return `${icon} ${styler.green(verb)} ${styler.dim(`#${event.id}`)} ${styler.bold(eventTitle(event))} ${styler.dim(`· ${meta.join(' · ')}`)}`;
+  const id = showId ? ` ${styler.dim(`#${event.id}`)}` : '';
+  return `${icon} ${styler.green(verb)}${id} ${styler.bold(eventTitle(event))} ${styler.dim(`· ${meta.join(' · ')}`)}`;
 }
 
 /** 最近记录列表（log） */

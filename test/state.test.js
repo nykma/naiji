@@ -1,5 +1,5 @@
 /**
- * buildState（/api/state 响应体）v2 聚合测试。
+ * buildState（/api/state 响应体）v3 聚合测试。
  *
  * 固定 NOW = 2026-11-13T04:00:00Z：东八区（tzOffset=-480）为 2026-11-13 12:00，
  * 当天窗口 = [2026-11-12T16:00Z, 2026-11-13T16:00Z)。所有断言不依赖真实时钟。
@@ -32,6 +32,7 @@ const EMPTY_TODAY = {
   peeCount: 0,
   poopCount: 0,
   mixedCount: 0,
+  bathCount: 0,
 };
 
 function makeStore(t) {
@@ -49,6 +50,10 @@ function addDiaper(store, happenedAt, diaperKind, note = null) {
   return store.createDiaperEvent({ diaperKind, note, happenedAt, createdAt: NOW });
 }
 
+function addBath(store, happenedAt, note = null) {
+  return store.createBathEvent({ note, happenedAt, createdAt: NOW });
+}
+
 describe('buildState · 空库', () => {
   test('today 全为 0、last* 为 null、recent 为空、now 原样返回', (t) => {
     const store = makeStore(t);
@@ -57,6 +62,7 @@ describe('buildState · 空库', () => {
     assert.deepEqual(state.today, EMPTY_TODAY);
     assert.equal(state.lastFeeding, null);
     assert.equal(state.lastDiaper, null);
+    assert.equal(state.lastBath, null);
     assert.deepEqual(state.recent, []);
   });
 });
@@ -73,6 +79,7 @@ describe('buildState · today 聚合（tzOffset = -480）', () => {
     addDiaper(store, atLocal(2026, 11, 13, 10, 0), 'pee');
     addDiaper(store, atLocal(2026, 11, 13, 10, 30), 'mixed');
     addDiaper(store, atLocal(2026, 11, 13, 11, 0), 'poop');
+    addBath(store, atLocal(2026, 11, 13, 11, 30), '洗香香');
 
     const state = buildState(store, NOW, TZ_SHANGHAI);
 
@@ -87,18 +94,22 @@ describe('buildState · today 聚合（tzOffset = -480）', () => {
     assert.equal(state.today.peeCount, 2, 'mixed 同时计入 pee');
     assert.equal(state.today.poopCount, 2, 'mixed 同时计入 poop');
     assert.equal(state.today.mixedCount, 1);
+    assert.equal(state.today.bathCount, 1, '洗澡计入 bathCount');
 
-    // lastFeeding / lastDiaper 取各 kind 最新
+    // lastFeeding / lastDiaper / lastBath 取各 kind 最新
     assert.equal(state.lastFeeding.id, 4);
     assert.deepEqual(state.lastFeeding.feedTypes, ['formula', 'breast_direct']);
     assert.equal(state.lastFeeding.feedTypes.length > 1, true);
     assert.equal(state.lastDiaper.id, 7);
     assert.equal(state.lastDiaper.diaperKind, 'poop');
+    assert.equal(state.lastBath.id, 8);
+    assert.equal(state.lastBath.kind, 'bath');
+    assert.equal(state.lastBath.note, '洗香香');
 
-    assert.equal(state.recent.length, 7);
+    assert.equal(state.recent.length, 8);
     assert.deepEqual(
       state.recent.map((event) => event.id),
-      [7, 6, 5, 4, 3, 2, 1],
+      [8, 7, 6, 5, 4, 3, 2, 1],
       'recent 按 happenedAt DESC, id DESC',
     );
   });
@@ -135,6 +146,41 @@ describe('buildState · today 聚合（tzOffset = -480）', () => {
     assert.equal(state.today.breastDirectCount, 1);
     assert.equal(state.today.feedCount, 2);
     assert.equal(state.today.totalMl, 120);
+  });
+
+  test('洗澡：只计入 bathCount，不影响喂奶/大小便计数与 lastFeeding/lastDiaper', (t) => {
+    const store = makeStore(t);
+    const feed = addFeed(store, atLocal(2026, 11, 13, 8, 0), ['formula'], 120);
+    const diaper = addDiaper(store, atLocal(2026, 11, 13, 9, 0), 'pee');
+    // 洗澡发生在更晚时间，但仍不应改变 lastFeeding / lastDiaper
+    const bath = addBath(store, atLocal(2026, 11, 13, 20, 0), '晚上洗澡');
+
+    const state = buildState(store, NOW, TZ_SHANGHAI);
+    assert.equal(state.today.bathCount, 1);
+    assert.equal(state.today.feedCount, 1);
+    assert.equal(state.today.totalMl, 120);
+    assert.equal(state.today.diaperCount, 1);
+    assert.equal(state.lastFeeding.id, feed.id);
+    assert.equal(state.lastDiaper.id, diaper.id);
+    assert.equal(state.lastBath.id, bath.id);
+    assert.equal(state.lastBath.feedTypes, null);
+    assert.equal(state.lastBath.amountMl, null);
+    assert.equal(state.lastBath.diaperKind, null);
+  });
+
+  test('多次洗澡：bathCount 累加，lastBath 取 happenedAt DESC 最新一条', (t) => {
+    const store = makeStore(t);
+    addBath(store, atLocal(2026, 11, 13, 8, 0));
+    addBath(store, atLocal(2026, 11, 13, 19, 0), '最新');
+    addBath(store, atLocal(2026, 11, 13, 12, 0));
+    // 昨天与后一天的洗澡不计入 today，但 lastBath 仍取全局最新
+    addBath(store, SH_DAY_START - 1, '昨天');
+    const outsideLatest = addBath(store, SH_DAY_END, '明天');
+
+    const state = buildState(store, NOW, TZ_SHANGHAI);
+    assert.equal(state.today.bathCount, 3, '只统计今天窗口内的洗澡');
+    assert.equal(state.lastBath.id, outsideLatest.id, 'lastBath 不受今天窗口限制');
+    assert.equal(state.lastBath.note, '明天');
   });
 });
 
